@@ -292,23 +292,31 @@ async def get_menace_leaderboard(
 
 # ==================== TIMER ENDPOINT ====================
 
-# Define leaderboard end times (you can customize these)
-LEADERBOARD_END_TIMES = {
-    "menace": datetime(2026, 2, 28, 23, 59, 59, tzinfo=timezone.utc),
-    "metaspins": datetime(2026, 2, 28, 23, 59, 59, tzinfo=timezone.utc),
-    "winovo": datetime(2026, 2, 28, 23, 59, 59, tzinfo=timezone.utc),
-    "csgowin": datetime(2026, 2, 28, 23, 59, 59, tzinfo=timezone.utc),
-}
+# Define leaderboard end times - dynamically calculated
+def get_leaderboard_end_times():
+    """Get leaderboard end times based on current date"""
+    current_time = datetime.now(timezone.utc)
+    
+    return {
+        "menace": current_time + timedelta(days=7),  # 1 week for bi-weekly leaderboard
+        "metaspins": current_time + timedelta(days=30),  # 30 days for monthly
+        "winovo": current_time + timedelta(days=30),  # 30 days for monthly
+        "csgowin": current_time + timedelta(days=30),  # 30 days for monthly
+    }
+
+LEADERBOARD_END_TIMES = get_leaderboard_end_times()
 
 @api_router.get("/timer/{site}")
 async def get_timer(site: str):
     """Get synchronized countdown timer for a specific leaderboard site"""
     try:
         site = site.lower()
-        if site not in LEADERBOARD_END_TIMES:
+        # Refresh end times to ensure they're always calculated from current time
+        end_times = get_leaderboard_end_times()
+        if site not in end_times:
             raise HTTPException(status_code=404, detail=f"Timer for site '{site}' not found")
         
-        end_time = LEADERBOARD_END_TIMES[site]
+        end_time = end_times[site]
         current_time = datetime.now(timezone.utc)
         
         time_remaining = end_time - current_time
@@ -353,9 +361,11 @@ async def get_all_timers():
     """Get synchronized countdown timers for all leaderboard sites"""
     try:
         current_time = datetime.now(timezone.utc)
+        # Refresh end times to ensure they're always calculated from current time
+        end_times = get_leaderboard_end_times()
         timers = {}
         
-        for site, end_time in LEADERBOARD_END_TIMES.items():
+        for site, end_time in end_times.items():
             time_remaining = end_time - current_time
             
             if time_remaining.total_seconds() <= 0:
