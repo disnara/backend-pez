@@ -16,6 +16,13 @@ import json
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
+# Configure logging first
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
 # MongoDB connection
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
@@ -101,15 +108,15 @@ async def get_csgowin_leaderboard():
     """Fetch CSGO WIN leaderboard data"""
     try:
         api_key = "b4adbcafb8"
+        affiliate_code = "pezslaps"
         headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
+            "x-apikey": api_key
         }
         
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # Based on CSGO WIN docs - adjust endpoint as needed
+            # Correct endpoint based on CSGO WIN API documentation
             response = await client.get(
-                "https://api.csgowin.com/v1/leaderboard",
+                f"https://api.csgowin.com/api/leaderboard/{affiliate_code}",
                 headers=headers
             )
             response.raise_for_status()
@@ -134,14 +141,13 @@ async def get_winovo_leaderboard():
     try:
         api_key = "a9d4f2c7b0e1f6d8c5a3b9e0d2"
         headers = {
-            "X-API-Key": api_key,
-            "Content-Type": "application/json"
+            "x-creator-auth": api_key
         }
         
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # Based on Winovo GitHub docs - adjust endpoint as needed
+            # Try alternative base URL - winovo.io instead of api.winovo.io
             response = await client.get(
-                "https://api.winovo.io/v1/creator/leaderboard",
+                "https://winovo.io/api/creator/users",
                 headers=headers
             )
             response.raise_for_status()
@@ -302,13 +308,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
