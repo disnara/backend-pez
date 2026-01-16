@@ -31,15 +31,6 @@ db = client[os.environ['DB_NAME']]
 # Create the main app without a prefix
 app = FastAPI()
 
-# Add CORS middleware FIRST - before any routes
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
@@ -97,12 +88,31 @@ async def get_metaspins_leaderboard():
                 "https://exportdata.xcdn.tech/metaspins-affiliate-leaderboard-export/1808/182639827/1099561537.json"
             )
             response.raise_for_status()
-            data = response.json()
-            return {
-                "success": True,
-                "site": "metaspins",
-                "data": data
-            }
+            api_response = response.json()
+            
+            # Format Metaspins response
+            if isinstance(api_response, list):
+                formatted_users = []
+                for idx, user in enumerate(api_response[:20]):  # Top 20
+                    formatted_users.append({
+                        "rank": idx + 1,
+                        "username": user.get("username", "Unknown"),
+                        "wagered": user.get("bets", 0),  # Metaspins uses "bets" instead of "wagered"
+                        "avatar": ""  # Metaspins doesn't provide avatars in this endpoint
+                    })
+                
+                return {
+                    "success": True,
+                    "site": "metaspins",
+                    "data": formatted_users
+                }
+            else:
+                logger.warning("Metaspins API returned unexpected format")
+                return {
+                    "success": False,
+                    "site": "metaspins",
+                    "data": []
+                }
     except httpx.HTTPError as e:
         logger.error(f"Metaspins API error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch Metaspins leaderboard: {str(e)}")
@@ -114,7 +124,7 @@ async def get_metaspins_leaderboard():
 # CSGO WIN Leaderboard
 @api_router.get("/leaderboard/csgowin")
 async def get_csgowin_leaderboard():
-    """Fetch CSGO WIN leaderboard data"""
+    """Fetch CSGO WIN leaderboard data using affiliate/external endpoint"""
     try:
         api_key = "b4adbcafb8"
         affiliate_code = "pezslaps"
@@ -122,19 +132,54 @@ async def get_csgowin_leaderboard():
             "x-apikey": api_key
         }
         
+        # Calculate time range - last 30 days to future
+        from datetime import datetime, timedelta
+        start_time = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)
+        end_time = int((datetime.now() + timedelta(days=365)).timestamp() * 1000)
+        
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # Correct endpoint based on CSGO WIN API documentation
+            # Use affiliate/external endpoint with proper parameters
+            params = {
+                "code": affiliate_code,
+                "gt": start_time,
+                "lt": end_time,
+                "by": "wager",
+                "sort": "desc",
+                "take": 20
+            }
             response = await client.get(
-                f"https://api.csgowin.com/api/leaderboard/{affiliate_code}",
-                headers=headers
+                "https://api.csgowin.com/api/affiliate/external",
+                headers=headers,
+                params=params
             )
             response.raise_for_status()
             data = response.json()
-            return {
-                "success": True,
-                "site": "csgowin",
-                "data": data
-            }
+            
+            # Transform the response to match expected format
+            if data.get("success") and "data" in data:
+                users = data["data"]
+                # Convert coins to USD and format
+                formatted_users = []
+                for idx, user in enumerate(users[:20]):  # Top 20
+                    formatted_users.append({
+                        "rank": idx + 1,
+                        "username": user.get("name", "Unknown"),
+                        "wagered": user.get("wagered", 0) / 1.61,  # Convert coins to USD
+                        "avatar": user.get("steam_avatar", "")
+                    })
+                
+                return {
+                    "success": True,
+                    "site": "csgowin",
+                    "data": formatted_users
+                }
+            else:
+                logger.warning("CSGO WIN API returned unexpected format")
+                return {
+                    "success": False,
+                    "site": "csgowin",
+                    "data": []
+                }
     except httpx.HTTPError as e:
         logger.error(f"CSGO WIN API error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch CSGO WIN leaderboard: {str(e)}")
@@ -154,18 +199,38 @@ async def get_winovo_leaderboard():
         }
         
         async with httpx.AsyncClient(timeout=30.0) as client:
-            # Try alternative base URL - winovo.io instead of api.winovo.io
             response = await client.get(
                 "https://winovo.io/api/creator/users",
                 headers=headers
             )
             response.raise_for_status()
-            data = response.json()
-            return {
-                "success": True,
-                "site": "winovo",
-                "data": data
-            }
+            api_response = response.json()
+            
+            # Parse Winovo response format
+            if api_response.get("status") == "ok" and "data" in api_response:
+                users = api_response["data"]
+                # Format and rank users by wagered amount
+                formatted_users = []
+                for idx, user in enumerate(users[:20]):  # Top 20
+                    formatted_users.append({
+                        "rank": idx + 1,
+                        "username": user.get("name", "Unknown"),
+                        "wagered": user.get("wagered", 0),
+                        "avatar": user.get("pic", "")  # pic is optional
+                    })
+                
+                return {
+                    "success": True,
+                    "site": "winovo",
+                    "data": formatted_users
+                }
+            else:
+                logger.warning("Winovo API returned unexpected format")
+                return {
+                    "success": False,
+                    "site": "winovo",
+                    "data": []
+                }
     except httpx.HTTPError as e:
         logger.error(f"Winovo API error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch Winovo leaderboard: {str(e)}")
@@ -177,8 +242,8 @@ async def get_winovo_leaderboard():
 # Menace Leaderboard
 @api_router.get("/leaderboard/menace")
 async def get_menace_leaderboard(
-    date_start: Optional[str] = "2025-01-01",
-    date_end: Optional[str] = "2025-01-31",
+    date_start: Optional[str] = "2026-01-01",
+    date_end: Optional[str] = "2026-02-28",
     limit: Optional[int] = 20
 ):
     """Fetch Menace leaderboard data with customizable date range"""
@@ -192,12 +257,31 @@ async def get_menace_leaderboard(
             }
             response = await client.get(url, params=params)
             response.raise_for_status()
-            data = response.json()
-            return {
-                "success": True,
-                "site": "menace",
-                "data": data
-            }
+            api_response = response.json()
+            
+            # Parse Menace response - data is in "leaderboard" key
+            if "leaderboard" in api_response and isinstance(api_response["leaderboard"], list):
+                formatted_users = []
+                for user in api_response["leaderboard"][:20]:  # Top 20
+                    formatted_users.append({
+                        "rank": user.get("place", 0),
+                        "username": user.get("nickname", "Unknown"),
+                        "wagered": user.get("wagered", 0),
+                        "avatar": ""  # Menace doesn't provide avatars
+                    })
+                
+                return {
+                    "success": True,
+                    "site": "menace",
+                    "data": formatted_users
+                }
+            else:
+                logger.warning(f"Menace API returned unexpected format: {api_response}")
+                return {
+                    "success": False,
+                    "site": "menace",
+                    "data": []
+                }
     except httpx.HTTPError as e:
         logger.error(f"Menace API error: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch Menace leaderboard: {str(e)}")
@@ -309,6 +393,14 @@ async def get_all_timers():
 
 # Include the router in the main app
 app.include_router(api_router)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
