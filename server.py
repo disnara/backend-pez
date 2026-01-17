@@ -193,7 +193,7 @@ async def get_csgowin_leaderboard():
 async def get_winovo_leaderboard():
     """Fetch Winovo leaderboard data"""
     try:
-        api_key = "a9d4f2c7b0e1f6d8c5a3b9e0d2"
+        api_key = "9e0c7b5d1a6f4e2d8a3c0b7f1e"
         headers = {
             "x-creator-auth": api_key
         }
