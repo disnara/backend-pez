@@ -292,31 +292,27 @@ async def get_menace_leaderboard(
 
 # ==================== TIMER ENDPOINT ====================
 
-# Define leaderboard end times - dynamically calculated
-def get_leaderboard_end_times():
-    """Get leaderboard end times based on current date"""
-    current_time = datetime.now(timezone.utc)
-    
-    return {
-        "menace": current_time + timedelta(days=14),  # 14 days for bi-weekly leaderboard
-        "metaspins": current_time + timedelta(days=30),  # 30 days for monthly
-        "winovo": current_time + timedelta(days=7),  # 7 days for weekly
-        "csgowin": current_time + timedelta(days=14),  # 14 days for bi-weekly
-    }
+# Define FIXED leaderboard end times based on competition periods
+# Menace: Bi-weekly (14 days) | Metaspins: Monthly (30 days)
+# Winovo: Weekly (7 days) | CSGOWin: Bi-weekly (14 days)
 
-LEADERBOARD_END_TIMES = get_leaderboard_end_times()
+# Set to end at midnight for each competition period
+LEADERBOARD_END_TIMES = {
+    "menace": datetime(2026, 1, 31, 23, 59, 59, tzinfo=timezone.utc),      # Bi-weekly: 14 days
+    "metaspins": datetime(2026, 2, 16, 23, 59, 59, tzinfo=timezone.utc),   # Monthly: 30 days  
+    "winovo": datetime(2026, 1, 24, 23, 59, 59, tzinfo=timezone.utc),      # Weekly: 7 days
+    "csgowin": datetime(2026, 1, 31, 23, 59, 59, tzinfo=timezone.utc),     # Bi-weekly: 14 days
+}
 
 @api_router.get("/timer/{site}")
 async def get_timer(site: str):
     """Get synchronized countdown timer for a specific leaderboard site"""
     try:
         site = site.lower()
-        # Refresh end times to ensure they're always calculated from current time
-        end_times = get_leaderboard_end_times()
-        if site not in end_times:
+        if site not in LEADERBOARD_END_TIMES:
             raise HTTPException(status_code=404, detail=f"Timer for site '{site}' not found")
         
-        end_time = end_times[site]
+        end_time = LEADERBOARD_END_TIMES[site]
         current_time = datetime.now(timezone.utc)
         
         time_remaining = end_time - current_time
@@ -361,11 +357,9 @@ async def get_all_timers():
     """Get synchronized countdown timers for all leaderboard sites"""
     try:
         current_time = datetime.now(timezone.utc)
-        # Refresh end times to ensure they're always calculated from current time
-        end_times = get_leaderboard_end_times()
         timers = {}
         
-        for site, end_time in end_times.items():
+        for site, end_time in LEADERBOARD_END_TIMES.items():
             time_remaining = end_time - current_time
             
             if time_remaining.total_seconds() <= 0:
