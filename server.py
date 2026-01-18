@@ -121,72 +121,6 @@ async def get_metaspins_leaderboard():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# CSGO WIN Leaderboard
-@api_router.get("/leaderboard/csgowin")
-async def get_csgowin_leaderboard():
-    """Fetch CSGO WIN leaderboard data using affiliate/external endpoint"""
-    try:
-        api_key = "b4adbcafb8"
-        affiliate_code = "pezslaps"
-        headers = {
-            "x-apikey": api_key
-        }
-        
-        # Calculate time range - last 30 days to future
-        from datetime import datetime, timedelta
-        start_time = int((datetime.now() - timedelta(days=30)).timestamp() * 1000)
-        end_time = int((datetime.now() + timedelta(days=365)).timestamp() * 1000)
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            # Use affiliate/external endpoint with proper parameters
-            params = {
-                "code": affiliate_code,
-                "gt": start_time,
-                "lt": end_time,
-                "by": "wager",
-                "sort": "desc",
-                "take": 20
-            }
-            response = await client.get(
-                "https://api.csgowin.com/api/affiliate/external",
-                headers=headers,
-                params=params
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            # Transform the response to match expected format
-            if data.get("success") and "data" in data:
-                users = data["data"]
-                # Convert coins to USD and format
-                formatted_users = []
-                for idx, user in enumerate(users[:20]):  # Top 20
-                    formatted_users.append({
-                        "rank": idx + 1,
-                        "username": user.get("name", "Unknown"),
-                        "wagered": user.get("wagered", 0) / 1.61,  # Convert coins to USD
-                        "avatar": user.get("steam_avatar", "")
-                    })
-                
-                return {
-                    "success": True,
-                    "site": "csgowin",
-                    "data": formatted_users
-                }
-            else:
-                logger.warning("CSGO WIN API returned unexpected format")
-                return {
-                    "success": False,
-                    "site": "csgowin",
-                    "data": []
-                }
-    except httpx.HTTPError as e:
-        logger.error(f"CSGO WIN API error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch CSGO WIN leaderboard: {str(e)}")
-    except Exception as e:
-        logger.error(f"Unexpected error fetching CSGO WIN leaderboard: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
 
 # Winovo Leaderboard
 @api_router.get("/leaderboard/winovo")
@@ -294,14 +228,13 @@ async def get_menace_leaderboard(
 
 # Define FIXED leaderboard end times based on competition periods
 # Menace: Bi-weekly (14 days) | Metaspins: Monthly (30 days)
-# Winovo: Weekly (7 days) | CSGOWin: Bi-weekly (14 days)
+# Winovo: Weekly (7 days)
 
 # Set to end at midnight for each competition period
 LEADERBOARD_END_TIMES = {
     "menace": datetime(2026, 1, 31, 23, 59, 59, tzinfo=timezone.utc),      # Bi-weekly: 14 days
     "metaspins": datetime(2026, 2, 16, 23, 59, 59, tzinfo=timezone.utc),   # Monthly: 30 days  
     "winovo": datetime(2026, 1, 24, 23, 59, 59, tzinfo=timezone.utc),      # Weekly: 7 days
-    "csgowin": datetime(2026, 1, 31, 23, 59, 59, tzinfo=timezone.utc),     # Bi-weekly: 14 days
 }
 
 @api_router.get("/timer/{site}")
