@@ -176,7 +176,7 @@ async def get_winovo_leaderboard():
 # Menace Leaderboard
 @api_router.get("/leaderboard/menace")
 async def get_menace_leaderboard(
-    date_start: Optional[str] = "2026-01-01",
+    date_start: Optional[str] = "2026-01-10",
     date_end: Optional[str] = "2026-02-28",
     limit: Optional[int] = 20
 ):
