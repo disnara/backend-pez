@@ -177,7 +177,7 @@ async def get_winovo_leaderboard():
 @api_router.get("/leaderboard/menace")
 async def get_menace_leaderboard(
     date_start: Optional[str] = "2026-01-10",
-    date_end: Optional[str] = "2026-01-24",
+    date_end: Optional[str] = "2026-02-28",
     limit: Optional[int] = 20
 ):
     """Fetch Menace leaderboard data with customizable date range"""
@@ -234,8 +234,8 @@ async def get_menace_leaderboard(
 # Set to end at midnight (12:00 AM) UTC for each competition period
 LEADERBOARD_END_TIMES = {
     "metaspins": datetime(2026, 2, 1, 0, 0, 0, tzinfo=timezone.utc),    # End: 12:00 AM, 1 February 2026 (UTC)
-    "menace": datetime(2026, 1, 24, 0, 0, 0, tzinfo=timezone.utc),      # End: 12:00 AM, 23 January 2026 (UTC)
-    "winovo": datetime(2026, 1, 21, 0, 0, 0, tzinfo=timezone.utc),      # End: 12:00 AM, 20 January 2026 (UTC)
+    "menace": datetime(2026, 1, 23, 0, 0, 0, tzinfo=timezone.utc),      # End: 12:00 AM, 23 January 2026 (UTC)
+    "winovo": datetime(2026, 1, 19, 0, 0, 0, tzinfo=timezone.utc),      # End: 12:00 AM, 20 January 2026 (UTC)
 }
 
 @api_router.get("/timer/{site}")
