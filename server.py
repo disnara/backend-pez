@@ -227,15 +227,14 @@ async def get_menace_leaderboard(
 # ==================== TIMER ENDPOINT ====================
 
 # Define FIXED leaderboard end times based on competition periods
-# Metaspins: Monthly (January 1 - February 1)
-# Menace: Bi-weekly (January 9 - January 23)
-# Winovo: Weekly (January 13 - January 20)
+# Menace: Bi-weekly (14 days) | Metaspins: Monthly (30 days)
+# Winovo: Weekly (7 days)
 
-# Set to end at midnight (12:00 AM) UTC for each competition period
+# Set to end at midnight for each competition period
 LEADERBOARD_END_TIMES = {
-    "menace": datetime(2026, 1, 23, 0, 0, 0, tzinfo=timezone.utc),      # End: 12:00 AM, 23 January 2026 (UTC)
-    "metaspins": datetime(2026, 2, 1, 0, 0, 0, tzinfo=timezone.utc),    # End: 12:00 AM, 1 February 2026 (UTC)
-    "winovo": datetime(2026, 1, 20, 0, 0, 0, tzinfo=timezone.utc),      # End: 12:00 AM, 20 January 2026 (UTC)
+    "menace": datetime(2026, 1, 31, 23, 59, 59, tzinfo=timezone.utc),      # Bi-weekly: 14 days
+    "metaspins": datetime(2026, 2, 16, 23, 59, 59, tzinfo=timezone.utc),   # Monthly: 30 days  
+    "winovo": datetime(2026, 1, 24, 23, 59, 59, tzinfo=timezone.utc),      # Weekly: 7 days
 }
 
 @api_router.get("/timer/{site}")
