@@ -232,9 +232,9 @@ async def get_menace_leaderboard(
 
 # Set to end at midnight for each competition period
 LEADERBOARD_END_TIMES = {
-    "menace": datetime(2026, 1, 23, 0, 0, 0, tzinfo=timezone.utc),         # End: 12:00 AM, Jan 23, 2026 (UTC)
-    "metaspins": datetime(2026, 2, 1, 0, 0, 0, tzinfo=timezone.utc),       # End: 12:00 AM, Feb 1, 2026 (UTC)
-    "winovo": datetime(2026, 1, 20, 0, 0, 0, tzinfo=timezone.utc),         # End: 12:00 AM, Jan 20, 2026 (UTC)
+    "menace": datetime(2026, 1, 31, 23, 59, 59, tzinfo=timezone.utc),      # Bi-weekly: 14 days
+    "metaspins": datetime(2026, 2, 16, 23, 59, 59, tzinfo=timezone.utc),   # Monthly: 30 days  
+    "winovo": datetime(2026, 1, 24, 23, 59, 59, tzinfo=timezone.utc),      # Weekly: 7 days
 }
 
 @api_router.get("/timer/{site}")
