@@ -235,7 +235,7 @@ async def get_menace_leaderboard(
 LEADERBOARD_END_TIMES = {
     "metaspins": datetime(2026, 2, 1, 0, 0, 0, tzinfo=timezone.utc),    # End: 12:00 AM, 1 February 2026 (UTC)
     "menace": datetime(2026, 1, 24, 0, 0, 0, tzinfo=timezone.utc),      # End: 12:00 AM, 23 January 2026 (UTC)
-    "winovo": datetime(2026, 1, 20, 0, 0, 0, tzinfo=timezone.utc),      # End: 12:00 AM, 20 January 2026 (UTC)
+    "winovo": datetime(2026, 1, 21, 0, 0, 0, tzinfo=timezone.utc),      # End: 12:00 AM, 20 January 2026 (UTC)
 }
 
 @api_router.get("/timer/{site}")
