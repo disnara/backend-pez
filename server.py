@@ -121,63 +121,11 @@ async def get_metaspins_leaderboard():
         raise HTTPException(status_code=500, detail=str(e))
 
 
-
-# Winovo Leaderboard
-@api_router.get("/leaderboard/winovo")
-async def get_winovo_leaderboard():
-    """Fetch Winovo leaderboard data"""
-    try:
-        api_key = "9e0c7b5d1a6f4e2d8a3c0b7f1e"
-        headers = {
-            "x-creator-auth": api_key
-        }
-        
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(
-                "https://winovo.io/api/creator/users",
-                headers=headers
-            )
-            response.raise_for_status()
-            api_response = response.json()
-            
-            # Parse Winovo response format
-            if api_response.get("status") == "ok" and "data" in api_response:
-                users = api_response["data"]
-                # Format and rank users by wagered amount
-                formatted_users = []
-                for idx, user in enumerate(users[:20]):  # Top 20
-                    formatted_users.append({
-                        "rank": idx + 1,
-                        "username": user.get("name", "Unknown"),
-                        "wagered": user.get("wagered", 0),
-                        "avatar": user.get("pic", "")  # pic is optional
-                    })
-                
-                return {
-                    "success": True,
-                    "site": "winovo",
-                    "data": formatted_users
-                }
-            else:
-                logger.warning("Winovo API returned unexpected format")
-                return {
-                    "success": False,
-                    "site": "winovo",
-                    "data": []
-                }
-    except httpx.HTTPError as e:
-        logger.error(f"Winovo API error: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Failed to fetch Winovo leaderboard: {str(e)}")
-    except Exception as e:
-        logger.error(f"Unexpected error fetching Winovo leaderboard: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 # Menace Leaderboard
 @api_router.get("/leaderboard/menace")
 async def get_menace_leaderboard(
     date_start: Optional[str] = "2026-01-10",
-    date_end: Optional[str] = "2026-01-28",
+    date_end: Optional[str] = "2026-02-28",
     limit: Optional[int] = 20
 ):
     """Fetch Menace leaderboard data with customizable date range"""
@@ -228,14 +176,12 @@ async def get_menace_leaderboard(
 
 # Define FIXED leaderboard end times based on competition periods
 # Metaspins: Monthly (January 1 - February 1)
-# Menace: Bi-weekly (January 10 - January 28)
-# Winovo: Weekly (January 13 - January 20)
+# Menace: Bi-weekly (January 9 - January 23)
 
 # Set to end at midnight (12:00 AM) UTC for each competition period
 LEADERBOARD_END_TIMES = {
     "metaspins": datetime(2026, 2, 1, 0, 0, 0, tzinfo=timezone.utc),    # End: 12:00 AM, 1 February 2026 (UTC)
-    "menace": datetime(2026, 1, 24, 0, 0, 0, tzinfo=timezone.utc),      # End: 12:00 AM, 28 January 2026 (UTC)
-    "winovo": datetime(2026, 1, 21, 0, 0, 0, tzinfo=timezone.utc),      # End: 12:00 AM, 20 January 2026 (UTC)
+    "menace": datetime(2026, 1, 24, 0, 0, 0, tzinfo=timezone.utc),      # End: 12:00 AM, 23 January 2026 (UTC)
 }
 
 @api_router.get("/timer/{site}")
