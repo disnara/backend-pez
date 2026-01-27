@@ -570,6 +570,9 @@ async def admin_update_settings(site: str, settings: LeaderboardSettingsUpdate, 
     """Update leaderboard settings for a site (admin only)"""
     site = site.lower()
     
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available. Please configure MongoDB on Vercel.")
+    
     # Get existing settings
     existing = await get_leaderboard_settings(site)
     
@@ -579,12 +582,16 @@ async def admin_update_settings(site: str, settings: LeaderboardSettingsUpdate, 
         existing.update(update_data)
         existing["site"] = site
         
-        # Upsert to DB
-        await db.leaderboard_settings.update_one(
-            {"site": site},
-            {"$set": existing},
-            upsert=True
-        )
+        try:
+            # Upsert to DB
+            await db.leaderboard_settings.update_one(
+                {"site": site},
+                {"$set": existing},
+                upsert=True
+            )
+        except Exception as e:
+            logger.error(f"Failed to save settings: {e}")
+            raise HTTPException(status_code=500, detail=f"Failed to save settings: {str(e)}")
     
     return {"success": True, "message": f"Settings for {site} updated", "settings": existing}
 
