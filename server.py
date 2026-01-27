@@ -31,14 +31,17 @@ client = None
 db = None
 
 try:
-    if mongo_url and 'localhost' not in mongo_url:
-        client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
+    if mongo_url:
+        # Connect to MongoDB (works with Atlas or any MongoDB URL)
+        client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=10000)
         db = client[db_name]
-        logger.info("MongoDB connection initialized")
+        logger.info(f"MongoDB connection initialized to database: {db_name}")
     else:
-        logger.warning("MongoDB not configured or using localhost - running without database")
+        logger.warning("MONGO_URL not set - running without database")
 except Exception as e:
     logger.warning(f"MongoDB connection failed: {e} - running without database")
+    client = None
+    db = None
 
 # Create the main app without a prefix
 app = FastAPI()
