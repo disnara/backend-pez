@@ -55,6 +55,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Global exception handler to ensure CORS headers are always sent
+from fastapi.responses import JSONResponse
+from starlette.requests import Request
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception: {exc}")
+    return JSONResponse(
+        status_code=500,
+        content={"detail": str(exc)},
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "*",
+            "Access-Control-Allow-Headers": "*",
+        }
+    )
+
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
