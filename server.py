@@ -601,51 +601,82 @@ async def admin_update_settings(site: str, settings: LeaderboardSettingsUpdate, 
 @api_router.get("/admin/challenges")
 async def admin_get_challenges(username: str = Depends(verify_admin)):
     """Get all challenges (admin only)"""
-    challenges = await db.challenges.find({}, {"_id": 0}).to_list(100)
-    return {"success": True, "challenges": challenges}
+    if db is None:
+        return {"success": True, "challenges": []}
+    try:
+        challenges = await db.challenges.find({}, {"_id": 0}).to_list(100)
+        return {"success": True, "challenges": challenges}
+    except Exception as e:
+        logger.error(f"Failed to get challenges: {e}")
+        return {"success": True, "challenges": []}
 
 @api_router.post("/admin/challenges")
 async def admin_create_challenge(challenge: ChallengeCreate, username: str = Depends(verify_admin)):
     """Create a new challenge (admin only)"""
-    challenge_dict = challenge.model_dump()
-    challenge_dict["id"] = str(uuid.uuid4())
-    challenge_dict["created_at"] = datetime.now(timezone.utc).isoformat()
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available. Please configure MongoDB on Vercel.")
     
-    await db.challenges.insert_one(challenge_dict)
-    
-    # Remove MongoDB _id before returning
-    challenge_dict.pop("_id", None)
-    
-    return {"success": True, "message": "Challenge created", "challenge": challenge_dict}
+    try:
+        challenge_dict = challenge.model_dump()
+        challenge_dict["id"] = str(uuid.uuid4())
+        challenge_dict["created_at"] = datetime.now(timezone.utc).isoformat()
+        
+        await db.challenges.insert_one(challenge_dict)
+        
+        # Remove MongoDB _id before returning
+        challenge_dict.pop("_id", None)
+        
+        return {"success": True, "message": "Challenge created", "challenge": challenge_dict}
+    except Exception as e:
+        logger.error(f"Failed to create challenge: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to create challenge: {str(e)}")
 
 @api_router.put("/admin/challenges/{challenge_id}")
 async def admin_update_challenge(challenge_id: str, challenge: ChallengeUpdate, username: str = Depends(verify_admin)):
     """Update a challenge (admin only)"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available. Please configure MongoDB on Vercel.")
+    
     update_data = challenge.model_dump(exclude_none=True)
     
     if not update_data:
         raise HTTPException(status_code=400, detail="No data to update")
     
-    result = await db.challenges.update_one(
-        {"id": challenge_id},
-        {"$set": update_data}
-    )
-    
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Challenge not found")
-    
-    updated = await db.challenges.find_one({"id": challenge_id}, {"_id": 0})
-    return {"success": True, "message": "Challenge updated", "challenge": updated}
+    try:
+        result = await db.challenges.update_one(
+            {"id": challenge_id},
+            {"$set": update_data}
+        )
+        
+        if result.matched_count == 0:
+            raise HTTPException(status_code=404, detail="Challenge not found")
+        
+        updated = await db.challenges.find_one({"id": challenge_id}, {"_id": 0})
+        return {"success": True, "message": "Challenge updated", "challenge": updated}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to update challenge: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to update challenge: {str(e)}")
 
 @api_router.delete("/admin/challenges/{challenge_id}")
 async def admin_delete_challenge(challenge_id: str, username: str = Depends(verify_admin)):
     """Delete a challenge (admin only)"""
-    result = await db.challenges.delete_one({"id": challenge_id})
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available. Please configure MongoDB on Vercel.")
     
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Challenge not found")
-    
-    return {"success": True, "message": "Challenge deleted"}
+    try:
+        result = await db.challenges.delete_one({"id": challenge_id})
+        
+        if result.deleted_count == 0:
+            raise HTTPException(status_code=404, detail="Challenge not found")
+        
+        return {"success": True, "message": "Challenge deleted"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to delete challenge: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to delete challenge: {str(e)}")
 
 
 # Include the router in the main app
