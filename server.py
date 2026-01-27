@@ -24,13 +24,33 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# MongoDB connection
-mongo_url = os.environ['MONGO_URL']
-client = AsyncIOMotorClient(mongo_url)
-db = client[os.environ['DB_NAME']]
+# MongoDB connection (optional - gracefully handle if not available)
+mongo_url = os.environ.get('MONGO_URL', '')
+db_name = os.environ.get('DB_NAME', 'pezrewards')
+client = None
+db = None
+
+try:
+    if mongo_url and 'localhost' not in mongo_url:
+        client = AsyncIOMotorClient(mongo_url, serverSelectionTimeoutMS=5000)
+        db = client[db_name]
+        logger.info("MongoDB connection initialized")
+    else:
+        logger.warning("MongoDB not configured or using localhost - running without database")
+except Exception as e:
+    logger.warning(f"MongoDB connection failed: {e} - running without database")
 
 # Create the main app without a prefix
 app = FastAPI()
+
+# Add CORS middleware FIRST (before routes)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
@@ -170,9 +190,13 @@ DEFAULT_LEADERBOARD_SETTINGS = {
 
 async def get_leaderboard_settings(site: str):
     """Get leaderboard settings from DB or return defaults"""
-    settings = await db.leaderboard_settings.find_one({"site": site}, {"_id": 0})
-    if settings:
-        return settings
+    if db is not None:
+        try:
+            settings = await db.leaderboard_settings.find_one({"site": site}, {"_id": 0})
+            if settings:
+                return settings
+        except Exception as e:
+            logger.warning(f"Failed to get settings from DB: {e}")
     return DEFAULT_LEADERBOARD_SETTINGS.get(site, {})
 
 @api_router.get("/settings/{site}")
@@ -288,15 +312,25 @@ async def get_menace_leaderboard(
 
 # Bitfortune Leaderboard
 BITFORTUNE_API_KEY = "082a6a65-4da1-425c-9b44-cf609e988672"
+BITFORTUNE_START_TIMESTAMP = 1769472000
+BITFORTUNE_END_TIMESTAMP = 1772150400
 
 @api_router.get("/leaderboard/bitfortune")
 async def get_bitfortune_leaderboard():
     """Fetch Bitfortune leaderboard data"""
     try:
-        # Get settings from DB for fetch dates
-        settings = await get_leaderboard_settings("bitfortune")
-        fetch_start = settings.get("fetch_start", 1769472000)
-        fetch_end = settings.get("fetch_end", 1772150400)
+        # Use hardcoded defaults, try DB only if available
+        fetch_start = BITFORTUNE_START_TIMESTAMP
+        fetch_end = BITFORTUNE_END_TIMESTAMP
+        
+        try:
+            settings = await get_leaderboard_settings("bitfortune")
+            if settings.get("fetch_start"):
+                fetch_start = settings.get("fetch_start")
+            if settings.get("fetch_end"):
+                fetch_end = settings.get("fetch_end")
+        except Exception:
+            pass  # Use defaults if DB not available
         
         async with httpx.AsyncClient(timeout=30.0) as http_client:
             url = "https://platformv2.bitfortune.com/api/v1/external/affiliates/leaderboard"
@@ -354,21 +388,27 @@ async def get_bitfortune_leaderboard():
 
 # ==================== TIMER ENDPOINT ====================
 
+# Default end times (hardcoded fallback)
+DEFAULT_END_TIMES = {
+    "metaspins": datetime(2026, 2, 1, 0, 0, 0, tzinfo=timezone.utc),
+    "menace": datetime(2026, 2, 7, 0, 0, 0, tzinfo=timezone.utc),
+    "bitfortune": datetime(2026, 2, 27, 0, 0, 0, tzinfo=timezone.utc),
+}
+
 async def get_leaderboard_end_time(site: str):
     """Get end time from DB settings or use defaults"""
-    settings = await get_leaderboard_settings(site)
-    end_date_str = settings.get("end_date")
+    # Try to get from DB first
+    try:
+        settings = await get_leaderboard_settings(site)
+        end_date_str = settings.get("end_date")
+        
+        if end_date_str:
+            return datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+    except Exception:
+        pass  # Use defaults if DB not available
     
-    if end_date_str:
-        return datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
-    
-    # Default end times
-    defaults = {
-        "metaspins": datetime(2026, 2, 1, 0, 0, 0, tzinfo=timezone.utc),
-        "menace": datetime(2026, 2, 7, 0, 0, 0, tzinfo=timezone.utc),
-        "bitfortune": datetime(2026, 2, 27, 0, 0, 0, tzinfo=timezone.utc),
-    }
-    return defaults.get(site)
+    # Return default end time
+    return DEFAULT_END_TIMES.get(site)
 
 @api_router.get("/timer/{site}")
 async def get_timer(site: str):
@@ -470,20 +510,38 @@ async def get_all_timers():
 @api_router.get("/challenges")
 async def get_challenges():
     """Get all challenges"""
-    challenges = await db.challenges.find({}, {"_id": 0}).to_list(100)
-    return {"success": True, "challenges": challenges}
+    if db is None:
+        return {"success": True, "challenges": []}
+    try:
+        challenges = await db.challenges.find({}, {"_id": 0}).to_list(100)
+        return {"success": True, "challenges": challenges}
+    except Exception as e:
+        logger.warning(f"Failed to get challenges: {e}")
+        return {"success": True, "challenges": []}
 
 @api_router.get("/challenges/active")
 async def get_active_challenges():
     """Get active challenges only"""
-    challenges = await db.challenges.find({"is_active": True}, {"_id": 0}).to_list(100)
-    return {"success": True, "challenges": challenges}
+    if db is None:
+        return {"success": True, "challenges": []}
+    try:
+        challenges = await db.challenges.find({"is_active": True}, {"_id": 0}).to_list(100)
+        return {"success": True, "challenges": challenges}
+    except Exception as e:
+        logger.warning(f"Failed to get active challenges: {e}")
+        return {"success": True, "challenges": []}
 
 @api_router.get("/challenges/completed")
 async def get_completed_challenges():
     """Get completed challenges only"""
-    challenges = await db.challenges.find({"is_active": False}, {"_id": 0}).to_list(100)
-    return {"success": True, "challenges": challenges}
+    if db is None:
+        return {"success": True, "challenges": []}
+    try:
+        challenges = await db.challenges.find({"is_active": False}, {"_id": 0}).to_list(100)
+        return {"success": True, "challenges": challenges}
+    except Exception as e:
+        logger.warning(f"Failed to get completed challenges: {e}")
+        return {"success": True, "challenges": []}
 
 
 # ==================== ADMIN ENDPOINTS ====================
@@ -583,14 +641,7 @@ async def admin_delete_challenge(challenge_id: str, username: str = Depends(veri
 # Include the router in the main app
 app.include_router(api_router)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
 @app.on_event("shutdown")
 async def shutdown_db_client():
-    client.close()
+    if client:
+        client.close()
