@@ -1,4 +1,5 @@
-from fastapi import FastAPI, APIRouter, HTTPException
+from fastapi import FastAPI, APIRouter, HTTPException, Depends
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -8,6 +9,7 @@ from pathlib import Path
 from pydantic import BaseModel, Field, ConfigDict
 from typing import List, Optional
 import uuid
+import secrets
 from datetime import datetime, timezone
 import httpx
 
@@ -33,6 +35,24 @@ app = FastAPI()
 # Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
+# HTTP Basic Auth for admin
+security = HTTPBasic()
+
+# Admin credentials
+ADMIN_USERNAME = "pezrewards"
+ADMIN_PASSWORD = "pezrewardadmin123"
+
+def verify_admin(credentials: HTTPBasicCredentials = Depends(security)):
+    correct_username = secrets.compare_digest(credentials.username, ADMIN_USERNAME)
+    correct_password = secrets.compare_digest(credentials.password, ADMIN_PASSWORD)
+    if not (correct_username and correct_password):
+        raise HTTPException(
+            status_code=401,
+            detail="Invalid credentials",
+            headers={"WWW-Authenticate": "Basic"},
+        )
+    return credentials.username
+
 
 # Define Models
 class StatusCheck(BaseModel):
@@ -44,6 +64,37 @@ class StatusCheck(BaseModel):
 
 class StatusCheckCreate(BaseModel):
     client_name: str
+
+class ChallengeCreate(BaseModel):
+    site: str
+    site_logo: str
+    game_name: str
+    game_image: str
+    multiplier: str
+    minimum_bet: str
+    reward: str
+    play_url: str
+    is_active: bool = True
+
+class ChallengeUpdate(BaseModel):
+    site: Optional[str] = None
+    site_logo: Optional[str] = None
+    game_name: Optional[str] = None
+    game_image: Optional[str] = None
+    multiplier: Optional[str] = None
+    minimum_bet: Optional[str] = None
+    reward: Optional[str] = None
+    play_url: Optional[str] = None
+    is_active: Optional[bool] = None
+
+class LeaderboardSettingsUpdate(BaseModel):
+    prize_pool: Optional[str] = None
+    period: Optional[str] = None
+    prizes: Optional[dict] = None
+    end_date: Optional[str] = None
+    fetch_start: Optional[int] = None
+    fetch_end: Optional[int] = None
+
 
 # Add your routes to the router instead of directly to app
 @api_router.get("/")
@@ -70,6 +121,75 @@ async def get_status_checks():
             check['timestamp'] = datetime.fromisoformat(check['timestamp'])
     
     return status_checks
+
+
+# ==================== LEADERBOARD SETTINGS ====================
+
+# Default settings (will be overridden by DB)
+DEFAULT_LEADERBOARD_SETTINGS = {
+    "menace": {
+        "prize_pool": "$1,500",
+        "period": "Bi-Weekly",
+        "register_link": "https://menace.com/?r=pez",
+        "logo": "image/menace.png",
+        "prizes": {
+            "1": "$600", "2": "$300", "3": "$200", "4": "$150", "5": "$100",
+            "6": "$60", "7": "$40", "8": "$30", "9": "$15", "10": "$5"
+        },
+        "end_date": "2026-02-07T00:00:00+00:00",
+        "fetch_start": None,
+        "fetch_end": None
+    },
+    "metaspins": {
+        "prize_pool": "$3,200",
+        "period": "Monthly",
+        "register_link": "https://metaspins.com/?ref=pezslaps",
+        "logo": "image/metaspins-logo.png",
+        "prizes": {
+            "1": "$1,300", "2": "$800", "3": "$500", "4": "$200", "5": "$120",
+            "6": "$80 Bonus Buy", "7": "$80 Bonus Buy", "8": "$40 Bonus Buy", "9": "$40 Bonus Buy", "10": "$40 Bonus Buy"
+        },
+        "end_date": "2026-02-01T00:00:00+00:00",
+        "fetch_start": None,
+        "fetch_end": None
+    },
+    "bitfortune": {
+        "prize_pool": "$5,000",
+        "period": "Monthly",
+        "register_link": "https://join.bitfortune.com/pezslaps",
+        "logo": "image/bitfortune-logo.png",
+        "prizes": {
+            "1": "$2,000", "2": "$1,200", "3": "$700", "4": "$400", "5": "$250",
+            "6": "$150", "7": "$120", "8": "$80", "9": "$60", "10": "$40"
+        },
+        "end_date": "2026-02-27T00:00:00+00:00",
+        "fetch_start": 1769472000,
+        "fetch_end": 1772150400
+    }
+}
+
+async def get_leaderboard_settings(site: str):
+    """Get leaderboard settings from DB or return defaults"""
+    settings = await db.leaderboard_settings.find_one({"site": site}, {"_id": 0})
+    if settings:
+        return settings
+    return DEFAULT_LEADERBOARD_SETTINGS.get(site, {})
+
+@api_router.get("/settings/{site}")
+async def get_site_settings(site: str):
+    """Get settings for a specific leaderboard site"""
+    settings = await get_leaderboard_settings(site.lower())
+    if not settings:
+        raise HTTPException(status_code=404, detail=f"Settings for site '{site}' not found")
+    return {"success": True, "site": site, "settings": settings}
+
+@api_router.get("/settings")
+async def get_all_settings():
+    """Get settings for all leaderboard sites"""
+    all_settings = {}
+    for site in ["menace", "metaspins", "bitfortune"]:
+        all_settings[site] = await get_leaderboard_settings(site)
+    return {"success": True, "settings": all_settings}
 
 
 # ==================== LEADERBOARD ENDPOINTS ====================
@@ -168,20 +288,22 @@ async def get_menace_leaderboard(
 
 # Bitfortune Leaderboard
 BITFORTUNE_API_KEY = "082a6a65-4da1-425c-9b44-cf609e988672"
-# Bitfortune leaderboard dates: Start 27/01/2026 00:00 UTC, End 27/02/2026 00:00 UTC
-BITFORTUNE_START_TIMESTAMP = 1769472000
-BITFORTUNE_END_TIMESTAMP = 1772150400
 
 @api_router.get("/leaderboard/bitfortune")
 async def get_bitfortune_leaderboard():
     """Fetch Bitfortune leaderboard data"""
     try:
+        # Get settings from DB for fetch dates
+        settings = await get_leaderboard_settings("bitfortune")
+        fetch_start = settings.get("fetch_start", 1769472000)
+        fetch_end = settings.get("fetch_end", 1772150400)
+        
         async with httpx.AsyncClient(timeout=30.0) as http_client:
             url = "https://platformv2.bitfortune.com/api/v1/external/affiliates/leaderboard"
             params = {
                 "api_key": BITFORTUNE_API_KEY,
-                "from": BITFORTUNE_START_TIMESTAMP,
-                "to": BITFORTUNE_END_TIMESTAMP
+                "from": fetch_start,
+                "to": fetch_end
             }
             response = await http_client.get(url, params=params)
             response.raise_for_status()
@@ -232,23 +354,33 @@ async def get_bitfortune_leaderboard():
 
 # ==================== TIMER ENDPOINT ====================
 
-LEADERBOARD_END_TIMES = {
-    "metaspins": datetime(2026, 2, 1, 0, 0, 0, tzinfo=timezone.utc),
-    "menace": datetime(2026, 2, 7, 0, 0, 0, tzinfo=timezone.utc),
-    "bitfortune": datetime(2026, 2, 27, 0, 0, 0, tzinfo=timezone.utc),
-}
+async def get_leaderboard_end_time(site: str):
+    """Get end time from DB settings or use defaults"""
+    settings = await get_leaderboard_settings(site)
+    end_date_str = settings.get("end_date")
+    
+    if end_date_str:
+        return datetime.fromisoformat(end_date_str.replace('Z', '+00:00'))
+    
+    # Default end times
+    defaults = {
+        "metaspins": datetime(2026, 2, 1, 0, 0, 0, tzinfo=timezone.utc),
+        "menace": datetime(2026, 2, 7, 0, 0, 0, tzinfo=timezone.utc),
+        "bitfortune": datetime(2026, 2, 27, 0, 0, 0, tzinfo=timezone.utc),
+    }
+    return defaults.get(site)
 
 @api_router.get("/timer/{site}")
 async def get_timer(site: str):
     """Get synchronized countdown timer for a specific leaderboard site"""
     try:
         site = site.lower()
-        if site not in LEADERBOARD_END_TIMES:
+        end_time = await get_leaderboard_end_time(site)
+        
+        if not end_time:
             raise HTTPException(status_code=404, detail=f"Timer for site '{site}' not found")
         
-        end_time = LEADERBOARD_END_TIMES[site]
         current_time = datetime.now(timezone.utc)
-        
         time_remaining = end_time - current_time
         
         if time_remaining.total_seconds() <= 0:
@@ -292,7 +424,11 @@ async def get_all_timers():
         current_time = datetime.now(timezone.utc)
         timers = {}
         
-        for site, end_time in LEADERBOARD_END_TIMES.items():
+        for site in ["menace", "metaspins", "bitfortune"]:
+            end_time = await get_leaderboard_end_time(site)
+            if not end_time:
+                continue
+                
             time_remaining = end_time - current_time
             
             if time_remaining.total_seconds() <= 0:
@@ -327,6 +463,122 @@ async def get_all_timers():
     except Exception as e:
         logger.error(f"Error calculating timers: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== CHALLENGES ENDPOINTS ====================
+
+@api_router.get("/challenges")
+async def get_challenges():
+    """Get all challenges"""
+    challenges = await db.challenges.find({}, {"_id": 0}).to_list(100)
+    return {"success": True, "challenges": challenges}
+
+@api_router.get("/challenges/active")
+async def get_active_challenges():
+    """Get active challenges only"""
+    challenges = await db.challenges.find({"is_active": True}, {"_id": 0}).to_list(100)
+    return {"success": True, "challenges": challenges}
+
+@api_router.get("/challenges/completed")
+async def get_completed_challenges():
+    """Get completed challenges only"""
+    challenges = await db.challenges.find({"is_active": False}, {"_id": 0}).to_list(100)
+    return {"success": True, "challenges": challenges}
+
+
+# ==================== ADMIN ENDPOINTS ====================
+
+@api_router.post("/admin/login")
+async def admin_login(credentials: dict):
+    """Admin login endpoint"""
+    username = credentials.get("username", "")
+    password = credentials.get("password", "")
+    
+    if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+        return {"success": True, "message": "Login successful"}
+    else:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+
+@api_router.get("/admin/settings")
+async def admin_get_all_settings(username: str = Depends(verify_admin)):
+    """Get all leaderboard settings (admin only)"""
+    all_settings = {}
+    for site in ["menace", "metaspins", "bitfortune"]:
+        all_settings[site] = await get_leaderboard_settings(site)
+    return {"success": True, "settings": all_settings}
+
+@api_router.put("/admin/settings/{site}")
+async def admin_update_settings(site: str, settings: LeaderboardSettingsUpdate, username: str = Depends(verify_admin)):
+    """Update leaderboard settings for a site (admin only)"""
+    site = site.lower()
+    
+    # Get existing settings
+    existing = await get_leaderboard_settings(site)
+    
+    # Update only provided fields
+    update_data = settings.model_dump(exclude_none=True)
+    if update_data:
+        existing.update(update_data)
+        existing["site"] = site
+        
+        # Upsert to DB
+        await db.leaderboard_settings.update_one(
+            {"site": site},
+            {"$set": existing},
+            upsert=True
+        )
+    
+    return {"success": True, "message": f"Settings for {site} updated", "settings": existing}
+
+@api_router.get("/admin/challenges")
+async def admin_get_challenges(username: str = Depends(verify_admin)):
+    """Get all challenges (admin only)"""
+    challenges = await db.challenges.find({}, {"_id": 0}).to_list(100)
+    return {"success": True, "challenges": challenges}
+
+@api_router.post("/admin/challenges")
+async def admin_create_challenge(challenge: ChallengeCreate, username: str = Depends(verify_admin)):
+    """Create a new challenge (admin only)"""
+    challenge_dict = challenge.model_dump()
+    challenge_dict["id"] = str(uuid.uuid4())
+    challenge_dict["created_at"] = datetime.now(timezone.utc).isoformat()
+    
+    await db.challenges.insert_one(challenge_dict)
+    
+    # Remove MongoDB _id before returning
+    challenge_dict.pop("_id", None)
+    
+    return {"success": True, "message": "Challenge created", "challenge": challenge_dict}
+
+@api_router.put("/admin/challenges/{challenge_id}")
+async def admin_update_challenge(challenge_id: str, challenge: ChallengeUpdate, username: str = Depends(verify_admin)):
+    """Update a challenge (admin only)"""
+    update_data = challenge.model_dump(exclude_none=True)
+    
+    if not update_data:
+        raise HTTPException(status_code=400, detail="No data to update")
+    
+    result = await db.challenges.update_one(
+        {"id": challenge_id},
+        {"$set": update_data}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+    
+    updated = await db.challenges.find_one({"id": challenge_id}, {"_id": 0})
+    return {"success": True, "message": "Challenge updated", "challenge": updated}
+
+@api_router.delete("/admin/challenges/{challenge_id}")
+async def admin_delete_challenge(challenge_id: str, username: str = Depends(verify_admin)):
+    """Delete a challenge (admin only)"""
+    result = await db.challenges.delete_one({"id": challenge_id})
+    
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Challenge not found")
+    
+    return {"success": True, "message": "Challenge deleted"}
+
 
 # Include the router in the main app
 app.include_router(api_router)
