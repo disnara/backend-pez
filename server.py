@@ -181,16 +181,16 @@ DEFAULT_LEADERBOARD_SETTINGS = {
         "fetch_end": None
     },
     "metaspins": {
-        "prize_pool": "$3,200",
+        "prize_pool": "$2,000",
         "period": "Monthly",
         "register_link": "https://metaspins.com/?ref=pezslaps",
         "logo": "image/metaspins-logo.png",
         "prizes": {
-            "1": "$1,300", "2": "$800", "3": "$500", "4": "$200", "5": "$120",
-            "6": "$80 Bonus Buy", "7": "$80 Bonus Buy", "8": "$40 Bonus Buy", "9": "$40 Bonus Buy", "10": "$40 Bonus Buy"
+            "1": "$700", "2": "$400", "3": "$250", "4": "$175", "5": "$150",
+            "6": "$110", "7": "$90", "8": "$75", "9": "$30", "10": "$20"
         },
-        "end_date": "2026-02-01T00:00:00+00:00",
-        "fetch_start": None,
+        "end_date": "2026-03-01T00:00:00+00:00",
+        "fetch_start": 1738368000,
         "fetch_end": None
     },
     "bitfortune": {
@@ -410,7 +410,7 @@ async def get_bitfortune_leaderboard():
 
 # Default end times (hardcoded fallback)
 DEFAULT_END_TIMES = {
-    "metaspins": datetime(2026, 2, 1, 0, 0, 0, tzinfo=timezone.utc),
+    "metaspins": datetime(2026, 3, 1, 0, 0, 0, tzinfo=timezone.utc),
     "menace": datetime(2026, 2, 7, 0, 0, 0, tzinfo=timezone.utc),
     "bitfortune": datetime(2026, 2, 27, 0, 0, 0, tzinfo=timezone.utc),
 }
