@@ -176,7 +176,7 @@ DEFAULT_LEADERBOARD_SETTINGS = {
             "1": "$600", "2": "$300", "3": "$200", "4": "$150", "5": "$100",
             "6": "$60", "7": "$40", "8": "$30", "9": "$15", "10": "$5"
         },
-        "end_date": "2026-02-07T00:00:00+00:00",
+        "end_date": "2026-02-21T00:00:00+00:00",
         "fetch_start": None,
         "fetch_end": None
     },
@@ -283,8 +283,8 @@ async def get_metaspins_leaderboard():
 # Menace Leaderboard
 @api_router.get("/leaderboard/menace")
 async def get_menace_leaderboard(
-    date_start: Optional[str] = "2026-01-24",
-    date_end: Optional[str] = "2026-02-07",
+    date_start: Optional[str] = "2026-02-07",
+    date_end: Optional[str] = "2026-02-21",
     limit: Optional[int] = 20
 ):
     """Fetch Menace leaderboard data with customizable date range"""
@@ -411,7 +411,7 @@ async def get_bitfortune_leaderboard():
 # Default end times (hardcoded fallback)
 DEFAULT_END_TIMES = {
     "metaspins": datetime(2026, 3, 1, 0, 0, 0, tzinfo=timezone.utc),
-    "menace": datetime(2026, 2, 7, 0, 0, 0, tzinfo=timezone.utc),
+    "menace": datetime(2026, 2, 21, 0, 0, 0, tzinfo=timezone.utc),
     "bitfortune": datetime(2026, 2, 27, 0, 0, 0, tzinfo=timezone.utc),
 }
 
