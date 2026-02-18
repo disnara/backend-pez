@@ -44,9 +44,26 @@ except Exception as e:
 KICK_CLIENT_ID = os.environ.get('KICK_CLIENT_ID', '')
 KICK_CLIENT_SECRET = os.environ.get('KICK_CLIENT_SECRET', '')
 KICK_REDIRECT_URI = os.environ.get('KICK_REDIRECT_URI', '')
-KICK_CHANNEL = os.environ.get('KICK_CHANNEL', 'mrbetsit')
+KICK_CHANNEL = os.environ.get('KICK_CHANNEL', 'pezslaps')
+KICK_ADMINS = [x.strip().lower() for x in os.environ.get('KICK_ADMINS', 'pezslaps').split(',')]
 JWT_SECRET = os.environ.get('JWT_SECRET', 'pezrewards_super_secret_key_2026')
-POINTS_PER_MESSAGE = int(os.environ.get('POINTS_PER_MESSAGE', '1'))
+# Default earning rates (can be overridden via admin panel)
+DEFAULT_POINTS_PER_MESSAGE = int(os.environ.get('POINTS_PER_MESSAGE', '1'))
+DEFAULT_COOLDOWN_SECONDS = int(os.environ.get('COOLDOWN_SECONDS', '30'))
+
+async def get_earning_rates():
+    """Get earning rates from database or defaults"""
+    if db is not None:
+        settings = await db.settings.find_one({"type": "earning_rates"})
+        if settings:
+            return {
+                "points_per_message": settings.get("points_per_message", DEFAULT_POINTS_PER_MESSAGE),
+                "cooldown_seconds": settings.get("cooldown_seconds", DEFAULT_COOLDOWN_SECONDS)
+            }
+    return {
+        "points_per_message": DEFAULT_POINTS_PER_MESSAGE,
+        "cooldown_seconds": DEFAULT_COOLDOWN_SECONDS
+    }
 
 # Create the main app
 app = FastAPI()
@@ -1143,9 +1160,11 @@ async def admin_get_bot_status(username: str = Depends(verify_admin)):
     bot_tokens = await db.settings.find_one({"type": "bot_tokens"}, {"_id": 0})
     bot_authorized = bot_tokens is not None and bot_tokens.get("access_token")
     
+    rates = await get_earning_rates()
+    
     bot_config = {
         "target_channel": KICK_CHANNEL,
-        "points_per_message": POINTS_PER_MESSAGE,
+        "points_per_message": rates.get("points_per_message", 1),
         "status": "fully_configured" if (channel_authorized and bot_authorized) else ("partially_configured" if (channel_authorized or bot_authorized) else "not_authorized"),
         "channel_account": channel_tokens.get("username") if channel_tokens else None,
         "bot_account": bot_tokens.get("username") if bot_tokens else None,
@@ -1285,25 +1304,29 @@ async def admin_bot_subscribe_events(username: str = Depends(verify_admin)):
 
 @api_router.get("/admin/earning-rates")
 async def admin_get_earning_rates(username: str = Depends(verify_admin)):
-    return {
-        "success": True,
-        "rates": {
-            "points_per_message": POINTS_PER_MESSAGE,
-            "cooldown_seconds": COOLDOWN_SECONDS
-        }
-    }
+    rates = await get_earning_rates()
+    return {"success": True, "rates": rates}
 
 @api_router.post("/admin/earning-rates")
-async def admin_update_earning_rates(username: str = Depends(verify_admin)):
-    # For now, return current rates (would need env var update for persistence)
-    return {
-        "success": True,
-        "message": "Earning rates are configured via environment variables",
-        "rates": {
-            "points_per_message": POINTS_PER_MESSAGE,
-            "cooldown_seconds": COOLDOWN_SECONDS
-        }
+async def admin_update_earning_rates(request: Request, username: str = Depends(verify_admin)):
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    body = await request.json()
+    
+    update_data = {
+        "type": "earning_rates",
+        "points_per_message": int(body.get("points_per_message", DEFAULT_POINTS_PER_MESSAGE)),
+        "cooldown_seconds": int(body.get("cooldown_seconds", DEFAULT_COOLDOWN_SECONDS))
     }
+    
+    await db.settings.update_one(
+        {"type": "earning_rates"},
+        {"$set": update_data},
+        upsert=True
+    )
+    
+    return {"success": True, "message": "Earning rates updated", "rates": update_data}
 
 
 # ==================== ALT ACCOUNTS ====================
@@ -1452,7 +1475,6 @@ async def admin_reset_leaderboard_timer(site: str, username: str = Depends(verif
 # ==================== KICK WEBHOOK ====================
 
 message_cooldowns = {}
-COOLDOWN_SECONDS = 30
 
 async def get_bot_access_token():
     if db is None:
@@ -1507,11 +1529,14 @@ async def send_kick_chat_message(message: str):
         logger.error(f"Error sending chat message: {e}")
         return False
 
-def can_earn_points(user_id: int) -> bool:
+async def can_earn_points(user_id: int) -> bool:
+    rates = await get_earning_rates()
+    cooldown_seconds = rates.get("cooldown_seconds", 30)
+    
     now = datetime.now(timezone.utc)
     if user_id in message_cooldowns:
         last_earned = message_cooldowns[user_id]
-        if (now - last_earned).total_seconds() < COOLDOWN_SECONDS:
+        if (now - last_earned).total_seconds() < cooldown_seconds:
             return False
     return True
 
@@ -1522,10 +1547,13 @@ async def award_points_for_chat(username: str, user_id: int):
     if db is None:
         return False
     
-    if not can_earn_points(user_id):
+    if not await can_earn_points(user_id):
         return False
     
     try:
+        rates = await get_earning_rates()
+        points_per_message = rates.get("points_per_message", 1)
+        
         user = await db.users.find_one({
             "$or": [
                 {"kick_username": {"$regex": f"^{username}$", "$options": "i"}},
@@ -1536,7 +1564,7 @@ async def award_points_for_chat(username: str, user_id: int):
         if not user or user.get('is_banned', False):
             return False
         
-        result = await db.users.update_one({"_id": user["_id"]}, {"$inc": {"points_balance": POINTS_PER_MESSAGE}})
+        result = await db.users.update_one({"_id": user["_id"]}, {"$inc": {"points_balance": points_per_message}})
         
         if result.modified_count > 0:
             update_cooldown(user_id)
@@ -1587,7 +1615,7 @@ async def handle_rank_command(username: str):
     return f"@{username} You are rank #{rank} out of {total_users} users with {user_points:,} points!"
 
 async def handle_tip_command(sender: str, content: str):
-    if sender.lower() != KICK_CHANNEL.lower():
+    if sender.lower() not in KICK_ADMINS:
         return f"@{sender} Only the channel owner can use !tip"
     
     parts = content.split()
@@ -1617,7 +1645,7 @@ async def handle_tip_command(sender: str, content: str):
     return f"@{sender} Failed to tip."
 
 async def handle_addpoints_command(sender: str, content: str):
-    if sender.lower() != KICK_CHANNEL.lower():
+    if sender.lower() not in KICK_ADMINS:
         return f"@{sender} Only the channel owner can use !addpoints"
     
     parts = content.split()
@@ -1647,7 +1675,7 @@ async def handle_addpoints_command(sender: str, content: str):
     return f"@{sender} Failed to add points."
 
 async def handle_removepoints_command(sender: str, content: str):
-    if sender.lower() != KICK_CHANNEL.lower():
+    if sender.lower() not in KICK_ADMINS:
         return f"@{sender} Only the channel owner can use !removepoints"
     
     parts = content.split()
@@ -1681,7 +1709,7 @@ async def handle_removepoints_command(sender: str, content: str):
     return f"@{sender} Failed to remove points."
 
 async def handle_setpoints_command(sender: str, content: str):
-    if sender.lower() != KICK_CHANNEL.lower():
+    if sender.lower() not in KICK_ADMINS:
         return f"@{sender} Only the channel owner can use !setpoints"
     
     parts = content.split()
@@ -1711,7 +1739,7 @@ async def handle_setpoints_command(sender: str, content: str):
     return f"@{sender} Failed to set points."
 
 async def handle_ban_command(sender: str, content: str):
-    if sender.lower() != KICK_CHANNEL.lower():
+    if sender.lower() not in KICK_ADMINS:
         return f"@{sender} Only the channel owner can use !ban"
     
     parts = content.split()
@@ -1734,7 +1762,7 @@ async def handle_ban_command(sender: str, content: str):
     return f"@{sender} Failed to ban user."
 
 async def handle_unban_command(sender: str, content: str):
-    if sender.lower() != KICK_CHANNEL.lower():
+    if sender.lower() not in KICK_ADMINS:
         return f"@{sender} Only the channel owner can use !unban"
     
     parts = content.split()
