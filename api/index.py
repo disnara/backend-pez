@@ -880,8 +880,10 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
         existing_user = await db.users.find_one({"kick_id": kick_id})
         
         if existing_user:
+            # Update existing user - also add kick_user_id if missing
             await db.users.update_one({"kick_id": kick_id}, {"$set": {
                 "kick_username": kick_username,
+                "kick_user_id": str(kick_user_id),  # Ensure kick_user_id is set
                 "avatar": avatar,
                 "last_login": datetime.now(timezone.utc).isoformat(),
                 "access_token": access_token,
@@ -894,6 +896,7 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
             new_user = {
                 "id": user_id,
                 "kick_id": kick_id,
+                "kick_user_id": str(kick_user_id),  # Added for chat point lookup
                 "kick_username": kick_username,
                 "avatar": avatar,
                 "discord_username": None,
@@ -1552,6 +1555,36 @@ async def admin_get_alt_accounts(username: str = Depends(verify_admin)):
     except Exception as e:
         logger.error(f"Error getting alt accounts: {e}")
         return {"success": True, "alt_groups": []}
+
+
+# ==================== DATABASE MIGRATION ====================
+
+@api_router.post("/admin/migrate-kick-user-ids")
+async def admin_migrate_kick_user_ids(username: str = Depends(verify_admin)):
+    """
+    One-time migration to add kick_user_id to existing users.
+    This fixes the points mismatch between !points command and website.
+    Users need to re-login after this migration to populate their kick_user_id.
+    """
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Find users missing kick_user_id
+    missing_count = await db.users.count_documents({"kick_user_id": {"$exists": False}})
+    
+    # For users with kick_id, copy it to kick_user_id (they're the same value)
+    result = await db.users.update_many(
+        {"kick_user_id": {"$exists": False}, "kick_id": {"$exists": True}},
+        [{"$set": {"kick_user_id": "$kick_id"}}]
+    )
+    
+    return {
+        "success": True,
+        "message": f"Migration complete. Updated {result.modified_count} users.",
+        "users_missing_before": missing_count,
+        "users_updated": result.modified_count,
+        "note": "Users who haven't logged in since migration will get kick_user_id on next login"
+    }
 
 
 # ==================== LEADERBOARD TIMERS ADMIN ====================
