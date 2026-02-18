@@ -597,18 +597,20 @@ async def kick_login(request: Request):
 @api_router.get("/auth/callback/kick")
 async def kick_callback(request: Request, code: str = None, state: str = None, error: str = None, error_description: str = None):
     is_bot_auth = state and state.startswith("bot_")
+    is_channel_auth = state and state.startswith("channel_")
+    is_admin_auth = is_bot_auth or is_channel_auth
     
     # Log the callback for debugging
     logger.info(f"Kick callback received - code: {bool(code)}, state: {bool(state)}, error: {error}, error_desc: {error_description}")
     
     if error:
-        if is_bot_auth:
-            return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?bot_error={error}")
+        if is_admin_auth:
+            return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?auth_error={error}")
         return RedirectResponse(url=f"{FRONTEND_URL}/?error={error}&desc={error_description or 'unknown'}")
     
     if not code or not state:
-        if is_bot_auth:
-            return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?bot_error=missing_params")
+        if is_admin_auth:
+            return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?auth_error=missing_params")
         return RedirectResponse(url=f"{FRONTEND_URL}/?error=missing_params")
     
     # Retrieve from MongoDB
@@ -616,8 +618,8 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
     logger.info(f"PKCE lookup - state: {state[:10]}..., found: {bool(code_verifier)}")
     
     if not code_verifier:
-        if is_bot_auth:
-            return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?bot_error=invalid_state")
+        if is_admin_auth:
+            return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?auth_error=invalid_state")
         return RedirectResponse(url=f"{FRONTEND_URL}/?error=invalid_state_pkce_not_found")
     
     try:
@@ -635,8 +637,8 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
             )
             
             if token_response.status_code != 200:
-                if is_bot_auth:
-                    return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?bot_error=token_failed")
+                if is_admin_auth:
+                    return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?auth_error=token_failed")
                 return RedirectResponse(url=f"{FRONTEND_URL}/?error=token_failed")
             
             tokens = token_response.json()
@@ -649,8 +651,8 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
             )
             
             if user_response.status_code != 200:
-                if is_bot_auth:
-                    return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?bot_error=user_fetch_failed")
+                if is_admin_auth:
+                    return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?auth_error=user_fetch_failed")
                 return RedirectResponse(url=f"{FRONTEND_URL}/?error=user_fetch_failed")
             
             kick_user = user_response.json()
@@ -665,10 +667,28 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
                 elif "user" in kick_user:
                     kick_user = kick_user["user"]
             
+            kick_username = kick_user.get("username") or kick_user.get("name") or "Unknown"
+            kick_user_id = kick_user.get("user_id") or kick_user.get("id")
+            
+            # Handle Channel Authorization (for receiving events)
+            if is_channel_auth:
+                if db is not None:
+                    await db.settings.update_one(
+                        {"type": "channel_tokens"},
+                        {"$set": {
+                            "type": "channel_tokens",
+                            "access_token": access_token,
+                            "refresh_token": refresh_token,
+                            "username": kick_username,
+                            "user_id": kick_user_id,
+                            "authorized_at": datetime.now(timezone.utc).isoformat()
+                        }},
+                        upsert=True
+                    )
+                return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?channel_success=true&channel_user={kick_username}")
+            
+            # Handle Bot Authorization (for sending messages)
             if is_bot_auth:
-                kick_username = kick_user.get("username") or kick_user.get("name") or "Unknown"
-                kick_user_id = kick_user.get("user_id") or kick_user.get("id")
-                
                 if db is not None:
                     await db.settings.update_one(
                         {"type": "bot_tokens"},
@@ -682,23 +702,12 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
                         }},
                         upsert=True
                     )
-                
-                # Subscribe to events
-                try:
-                    await http_client.post(
-                        "https://api.kick.com/public/v1/events/subscriptions",
-                        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
-                        json={"events": [{"name": "chat.message.sent", "version": 1}], "method": "webhook"}
-                    )
-                except:
-                    pass
-                
                 return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?bot_success=true&bot_user={kick_username}")
             
     except Exception as e:
         logger.error(f"OAuth error: {e}")
-        if is_bot_auth:
-            return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?bot_error=oauth_error")
+        if is_admin_auth:
+            return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?auth_error=oauth_error")
         return RedirectResponse(url=f"{FRONTEND_URL}/?error=oauth_error")
     
     client_ip = request.client.host if request.client else "unknown"
@@ -1126,20 +1135,49 @@ async def admin_get_bot_status(username: str = Depends(verify_admin)):
     if db is None:
         return {"success": True, "bot": {"status": "not_configured"}}
     
+    # Get channel tokens (for receiving events)
+    channel_tokens = await db.settings.find_one({"type": "channel_tokens"}, {"_id": 0})
+    channel_authorized = channel_tokens is not None and channel_tokens.get("access_token")
+    
+    # Get bot tokens (for sending messages)
     bot_tokens = await db.settings.find_one({"type": "bot_tokens"}, {"_id": 0})
-    is_authorized = bot_tokens is not None and bot_tokens.get("access_token")
+    bot_authorized = bot_tokens is not None and bot_tokens.get("access_token")
     
     bot_config = {
         "target_channel": KICK_CHANNEL,
         "points_per_message": POINTS_PER_MESSAGE,
-        "status": "authorized" if is_authorized else "not_authorized",
-        "authorized_user": bot_tokens.get("username") if bot_tokens else None,
+        "status": "fully_configured" if (channel_authorized and bot_authorized) else ("partially_configured" if (channel_authorized or bot_authorized) else "not_authorized"),
+        "channel_account": channel_tokens.get("username") if channel_tokens else None,
+        "bot_account": bot_tokens.get("username") if bot_tokens else None,
         "commands": ["!points", "!rank", "!leaderboard", "!tip", "!addpoints", "!removepoints", "!setpoints", "!ban", "!unban"]
     }
     return {"success": True, "bot": bot_config}
 
+@api_router.get("/admin/channel/authorize")
+async def admin_channel_authorize(username: str = Depends(verify_admin)):
+    """Authorize channel account (for receiving chat events)"""
+    state = "channel_" + secrets.token_urlsafe(32)
+    code_verifier = generate_code_verifier()
+    code_challenge = generate_code_challenge(code_verifier)
+    
+    await store_pkce(state, code_verifier)
+    
+    params = {
+        "client_id": KICK_CLIENT_ID,
+        "redirect_uri": KICK_REDIRECT_URI,
+        "response_type": "code",
+        "scope": "user:read channel:read events:subscribe",
+        "state": state,
+        "code_challenge": code_challenge,
+        "code_challenge_method": "S256"
+    }
+    
+    auth_url = f"https://id.kick.com/oauth/authorize?{urllib.parse.urlencode(params)}"
+    return {"success": True, "auth_url": auth_url}
+
 @api_router.get("/admin/bot/authorize")
 async def admin_bot_authorize(username: str = Depends(verify_admin)):
+    """Authorize bot account (for sending chat messages)"""
     state = "bot_" + secrets.token_urlsafe(32)
     code_verifier = generate_code_verifier()
     code_challenge = generate_code_challenge(code_verifier)
@@ -1151,7 +1189,7 @@ async def admin_bot_authorize(username: str = Depends(verify_admin)):
         "client_id": KICK_CLIENT_ID,
         "redirect_uri": KICK_REDIRECT_URI,
         "response_type": "code",
-        "scope": "user:read channel:read chat:write events:subscribe",
+        "scope": "user:read chat:write",
         "state": state,
         "code_challenge": code_challenge,
         "code_challenge_method": "S256"
@@ -1168,19 +1206,27 @@ async def admin_bot_revoke(username: str = Depends(verify_admin)):
     await db.settings.delete_one({"type": "bot_tokens"})
     return {"success": True, "message": "Bot authorization revoked"}
 
+@api_router.post("/admin/channel/revoke")
+async def admin_channel_revoke(username: str = Depends(verify_admin)):
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    await db.settings.delete_one({"type": "channel_tokens"})
+    return {"success": True, "message": "Channel authorization revoked"}
+
 @api_router.post("/admin/bot/subscribe-events")
 async def admin_bot_subscribe_events(username: str = Depends(verify_admin)):
-    """Manually subscribe to Kick webhook events"""
-    access_token = await get_bot_access_token()
-    if not access_token:
-        raise HTTPException(status_code=400, detail="Bot not authorized")
+    """Subscribe to chat events using channel token"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
     
-    # Get broadcaster ID from bot settings
-    broadcaster_id = None
-    if db is not None:
-        bot_settings = await db.settings.find_one({"type": "bot_tokens"})
-        if bot_settings:
-            broadcaster_id = bot_settings.get("user_id")
+    # Get CHANNEL token (for subscribing to events)
+    channel_tokens = await db.settings.find_one({"type": "channel_tokens"})
+    if not channel_tokens or not channel_tokens.get("access_token"):
+        raise HTTPException(status_code=400, detail="Channel account not authorized. Please authorize the channel first.")
+    
+    access_token = channel_tokens.get("access_token")
+    broadcaster_id = channel_tokens.get("user_id")
     
     webhook_url = "https://backend-pez.vercel.app/api/webhook/kick"
     
