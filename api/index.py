@@ -1175,7 +1175,14 @@ async def admin_bot_subscribe_events(username: str = Depends(verify_admin)):
     if not access_token:
         raise HTTPException(status_code=400, detail="Bot not authorized")
     
-    webhook_url = f"https://backend-pez.vercel.app/api/webhook/kick"
+    # Get broadcaster ID from bot settings
+    broadcaster_id = None
+    if db is not None:
+        bot_settings = await db.settings.find_one({"type": "bot_tokens"})
+        if bot_settings:
+            broadcaster_id = bot_settings.get("user_id")
+    
+    webhook_url = "https://backend-pez.vercel.app/api/webhook/kick"
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1190,15 +1197,21 @@ async def admin_bot_subscribe_events(username: str = Depends(verify_admin)):
                 headers=headers
             )
             logger.info(f"Current subscriptions: {check_response.status_code} - {check_response.text}")
+            current_subs = check_response.json() if check_response.status_code == 200 else {}
             
-            # Subscribe to chat events
+            # Subscribe to chat events with broadcaster ID
             payload = {
                 "events": [
                     {"name": "chat.message.sent", "version": 1}
                 ],
-                "method": "webhook",
-                "webhook_url": webhook_url
+                "method": "webhook"
             }
+            
+            # Add broadcaster_user_id if available
+            if broadcaster_id:
+                payload["broadcaster_user_id"] = int(broadcaster_id)
+            
+            logger.info(f"Subscribing with payload: {payload}")
             
             response = await client.post(
                 "https://api.kick.com/public/v1/events/subscriptions",
@@ -1208,20 +1221,15 @@ async def admin_bot_subscribe_events(username: str = Depends(verify_admin)):
             
             logger.info(f"Subscribe response: {response.status_code} - {response.text}")
             
-            if response.status_code in [200, 201]:
-                return {
-                    "success": True,
-                    "message": "Successfully subscribed to chat events",
-                    "webhook_url": webhook_url,
-                    "response": response.json() if response.text else {}
-                }
-            else:
-                return {
-                    "success": False,
-                    "message": f"Failed to subscribe: {response.status_code}",
-                    "error": response.text,
-                    "webhook_url": webhook_url
-                }
+            return {
+                "success": response.status_code in [200, 201],
+                "message": "Subscription request sent",
+                "webhook_url": webhook_url,
+                "broadcaster_id": broadcaster_id,
+                "subscribe_status": response.status_code,
+                "subscribe_response": response.json() if response.text else {},
+                "current_subscriptions": current_subs
+            }
     except Exception as e:
         logger.error(f"Error subscribing to events: {e}")
         raise HTTPException(status_code=500, detail=str(e))
