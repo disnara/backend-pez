@@ -239,8 +239,34 @@ async def get_admin_user(request: Request):
         raise HTTPException(status_code=403, detail="Admin access required")
     return user
 
-# PKCE store (in serverless, this resets per invocation - consider using Redis/DB for production)
-pkce_store = {}
+# Frontend URL for redirects
+FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://pezrewards.com')
+
+# PKCE helper functions for MongoDB storage
+async def store_pkce(state: str, code_verifier: str):
+    """Store PKCE code verifier in MongoDB for serverless compatibility"""
+    if db is not None:
+        await db.pkce_store.update_one(
+            {"state": state},
+            {"$set": {
+                "state": state,
+                "code_verifier": code_verifier,
+                "created_at": datetime.now(timezone.utc)
+            }},
+            upsert=True
+        )
+        # Clean up old entries (older than 10 minutes)
+        await db.pkce_store.delete_many({
+            "created_at": {"$lt": datetime.now(timezone.utc) - timedelta(minutes=10)}
+        })
+
+async def get_pkce(state: str) -> str:
+    """Retrieve and delete PKCE code verifier from MongoDB"""
+    if db is not None:
+        doc = await db.pkce_store.find_one_and_delete({"state": state})
+        if doc:
+            return doc.get("code_verifier")
+    return None
 
 
 # Default leaderboard settings
@@ -551,7 +577,8 @@ async def kick_login(request: Request):
     code_verifier = generate_code_verifier()
     code_challenge = generate_code_challenge(code_verifier)
     
-    pkce_store[state] = code_verifier
+    # Store in MongoDB for serverless compatibility
+    await store_pkce(state, code_verifier)
     
     params = {
         "client_id": KICK_CLIENT_ID,
@@ -572,19 +599,20 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
     
     if error:
         if is_bot_auth:
-            return RedirectResponse(url=f"/admin/dashboard.html?bot_error={error}")
-        return RedirectResponse(url="/?error=auth_failed")
+            return RedirectResponse(url=f"{FRONTEND_URL}/admin/dashboard.html?bot_error={error}")
+        return RedirectResponse(url=f"{FRONTEND_URL}/?error=auth_failed")
     
     if not code or not state:
         if is_bot_auth:
-            return RedirectResponse(url="/admin/dashboard.html?bot_error=missing_params")
-        return RedirectResponse(url="/?error=missing_params")
+            return RedirectResponse(url=f"{FRONTEND_URL}/admin/dashboard.html?bot_error=missing_params")
+        return RedirectResponse(url=f"{FRONTEND_URL}/?error=missing_params")
     
-    code_verifier = pkce_store.pop(state, None)
+    # Retrieve from MongoDB
+    code_verifier = await get_pkce(state)
     if not code_verifier:
         if is_bot_auth:
-            return RedirectResponse(url="/admin/dashboard.html?bot_error=invalid_state")
-        return RedirectResponse(url="/?error=invalid_state")
+            return RedirectResponse(url=f"{FRONTEND_URL}/admin/dashboard.html?bot_error=invalid_state")
+        return RedirectResponse(url=f"{FRONTEND_URL}/?error=invalid_state")
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as http_client:
@@ -602,8 +630,8 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
             
             if token_response.status_code != 200:
                 if is_bot_auth:
-                    return RedirectResponse(url="/admin/dashboard.html?bot_error=token_failed")
-                return RedirectResponse(url="/?error=token_failed")
+                    return RedirectResponse(url=f"{FRONTEND_URL}/admin/dashboard.html?bot_error=token_failed")
+                return RedirectResponse(url=f"{FRONTEND_URL}/?error=token_failed")
             
             tokens = token_response.json()
             access_token = tokens.get("access_token")
@@ -616,8 +644,8 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
             
             if user_response.status_code != 200:
                 if is_bot_auth:
-                    return RedirectResponse(url="/admin/dashboard.html?bot_error=user_fetch_failed")
-                return RedirectResponse(url="/?error=user_fetch_failed")
+                    return RedirectResponse(url=f"{FRONTEND_URL}/admin/dashboard.html?bot_error=user_fetch_failed")
+                return RedirectResponse(url=f"{FRONTEND_URL}/?error=user_fetch_failed")
             
             kick_user = user_response.json()
             
@@ -659,13 +687,13 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
                 except:
                     pass
                 
-                return RedirectResponse(url=f"/admin/dashboard.html?bot_success=true&bot_user={kick_username}")
+                return RedirectResponse(url=f"{FRONTEND_URL}/admin/dashboard.html?bot_success=true&bot_user={kick_username}")
             
     except Exception as e:
         logger.error(f"OAuth error: {e}")
         if is_bot_auth:
-            return RedirectResponse(url="/admin/dashboard.html?bot_error=oauth_error")
-        return RedirectResponse(url="/?error=oauth_error")
+            return RedirectResponse(url=f"{FRONTEND_URL}/admin/dashboard.html?bot_error=oauth_error")
+        return RedirectResponse(url=f"{FRONTEND_URL}/?error=oauth_error")
     
     client_ip = request.client.host if request.client else "unknown"
     
@@ -715,8 +743,8 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
     
     jwt_token = create_jwt_token(user_id, kick_username, is_admin)
     
-    response = RedirectResponse(url="/shop.html")
-    response.set_cookie(key="auth_token", value=jwt_token, httponly=True, secure=True, samesite="lax", max_age=7*24*60*60)
+    response = RedirectResponse(url=f"{FRONTEND_URL}/index.html")
+    response.set_cookie(key="auth_token", value=jwt_token, httponly=True, secure=True, samesite="none", max_age=7*24*60*60)
     return response
 
 @api_router.get("/auth/me")
