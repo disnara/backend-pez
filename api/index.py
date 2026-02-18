@@ -241,6 +241,7 @@ async def get_admin_user(request: Request):
 
 # Frontend URL for redirects
 FRONTEND_URL = os.environ.get('FRONTEND_URL', 'https://pezrewards.com')
+ADMIN_URL = os.environ.get('ADMIN_URL', 'https://admin.pezrewards.com')
 
 # PKCE helper functions for MongoDB storage
 async def store_pkce(state: str, code_verifier: str):
@@ -602,12 +603,12 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
     
     if error:
         if is_bot_auth:
-            return RedirectResponse(url=f"{FRONTEND_URL}/admin/dashboard.html?bot_error={error}")
+            return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?bot_error={error}")
         return RedirectResponse(url=f"{FRONTEND_URL}/?error={error}&desc={error_description or 'unknown'}")
     
     if not code or not state:
         if is_bot_auth:
-            return RedirectResponse(url=f"{FRONTEND_URL}/admin/dashboard.html?bot_error=missing_params")
+            return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?bot_error=missing_params")
         return RedirectResponse(url=f"{FRONTEND_URL}/?error=missing_params")
     
     # Retrieve from MongoDB
@@ -616,7 +617,7 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
     
     if not code_verifier:
         if is_bot_auth:
-            return RedirectResponse(url=f"{FRONTEND_URL}/admin/dashboard.html?bot_error=invalid_state")
+            return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?bot_error=invalid_state")
         return RedirectResponse(url=f"{FRONTEND_URL}/?error=invalid_state_pkce_not_found")
     
     try:
@@ -635,7 +636,7 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
             
             if token_response.status_code != 200:
                 if is_bot_auth:
-                    return RedirectResponse(url=f"{FRONTEND_URL}/admin/dashboard.html?bot_error=token_failed")
+                    return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?bot_error=token_failed")
                 return RedirectResponse(url=f"{FRONTEND_URL}/?error=token_failed")
             
             tokens = token_response.json()
@@ -649,7 +650,7 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
             
             if user_response.status_code != 200:
                 if is_bot_auth:
-                    return RedirectResponse(url=f"{FRONTEND_URL}/admin/dashboard.html?bot_error=user_fetch_failed")
+                    return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?bot_error=user_fetch_failed")
                 return RedirectResponse(url=f"{FRONTEND_URL}/?error=user_fetch_failed")
             
             kick_user = user_response.json()
@@ -692,12 +693,12 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
                 except:
                     pass
                 
-                return RedirectResponse(url=f"{FRONTEND_URL}/admin/dashboard.html?bot_success=true&bot_user={kick_username}")
+                return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?bot_success=true&bot_user={kick_username}")
             
     except Exception as e:
         logger.error(f"OAuth error: {e}")
         if is_bot_auth:
-            return RedirectResponse(url=f"{FRONTEND_URL}/admin/dashboard.html?bot_error=oauth_error")
+            return RedirectResponse(url=f"{ADMIN_URL}/dashboard.html?bot_error=oauth_error")
         return RedirectResponse(url=f"{FRONTEND_URL}/?error=oauth_error")
     
     client_ip = request.client.host if request.client else "unknown"
