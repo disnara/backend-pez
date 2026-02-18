@@ -1169,6 +1169,57 @@ async def admin_bot_revoke(username: str = Depends(verify_admin)):
     return {"success": True, "message": "Bot authorization revoked"}
 
 
+# ==================== EARNING RATES ====================
+
+@api_router.get("/admin/earning-rates")
+async def admin_get_earning_rates(username: str = Depends(verify_admin)):
+    return {
+        "success": True,
+        "rates": {
+            "points_per_message": POINTS_PER_MESSAGE,
+            "cooldown_seconds": COOLDOWN_SECONDS
+        }
+    }
+
+@api_router.post("/admin/earning-rates")
+async def admin_update_earning_rates(username: str = Depends(verify_admin)):
+    # For now, return current rates (would need env var update for persistence)
+    return {
+        "success": True,
+        "message": "Earning rates are configured via environment variables",
+        "rates": {
+            "points_per_message": POINTS_PER_MESSAGE,
+            "cooldown_seconds": COOLDOWN_SECONDS
+        }
+    }
+
+
+# ==================== ALT ACCOUNTS ====================
+
+@api_router.get("/admin/alt-accounts")
+async def admin_get_alt_accounts(username: str = Depends(verify_admin)):
+    if db is None:
+        return {"success": True, "alt_groups": []}
+    
+    try:
+        # Find users with same IP addresses
+        pipeline = [
+            {"$unwind": "$ip_addresses"},
+            {"$group": {
+                "_id": "$ip_addresses",
+                "users": {"$push": {"id": "$id", "kick_username": "$kick_username", "points_balance": "$points_balance"}},
+                "count": {"$sum": 1}
+            }},
+            {"$match": {"count": {"$gt": 1}}},
+            {"$project": {"_id": 0, "ip": "$_id", "users": 1, "count": 1}}
+        ]
+        alt_groups = await db.users.aggregate(pipeline).to_list(100)
+        return {"success": True, "alt_groups": alt_groups}
+    except Exception as e:
+        logger.error(f"Error getting alt accounts: {e}")
+        return {"success": True, "alt_groups": []}
+
+
 # ==================== LEADERBOARD TIMERS ADMIN ====================
 
 def calculate_next_period_end(current_end: datetime, period_type: str) -> datetime:
