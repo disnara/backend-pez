@@ -1305,21 +1305,36 @@ async def get_bot_access_token():
 async def send_kick_chat_message(message: str):
     access_token = await get_bot_access_token()
     if not access_token:
+        logger.error("No bot access token found")
         return False
     
     try:
         async with httpx.AsyncClient() as client:
             headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
-            payload = {"content": message, "type": "user"}
             
+            # Get the channel/broadcaster ID from settings
+            broadcaster_id = None
             if db is not None:
                 bot_settings = await db.settings.find_one({"type": "bot_tokens"})
-                if bot_settings and bot_settings.get("user_id"):
-                    payload["broadcaster_user_id"] = bot_settings.get("user_id")
+                if bot_settings:
+                    broadcaster_id = bot_settings.get("user_id") or bot_settings.get("broadcaster_id")
             
+            if not broadcaster_id:
+                logger.error("No broadcaster_id found for chat message")
+                return False
+            
+            payload = {
+                "content": message,
+                "type": "user",
+                "broadcaster_user_id": int(broadcaster_id)
+            }
+            
+            logger.info(f"Sending chat message to broadcaster {broadcaster_id}: {message[:50]}...")
             response = await client.post("https://api.kick.com/public/v1/chat", headers=headers, json=payload)
-            return response.status_code == 200
-    except:
+            logger.info(f"Chat API response: {response.status_code} - {response.text[:200] if response.text else 'empty'}")
+            return response.status_code in [200, 201]
+    except Exception as e:
+        logger.error(f"Error sending chat message: {e}")
         return False
 
 def can_earn_points(user_id: int) -> bool:
@@ -1577,13 +1592,15 @@ async def kick_webhook(request: Request):
         event_type = request.headers.get("Kick-Event-Type", "")
         body = await request.json()
         
-        logger.info(f"Received Kick webhook: {event_type}")
+        logger.info(f"Received Kick webhook: {event_type} - Body: {str(body)[:500]}")
         
         if event_type == "chat.message.sent":
             sender = body.get("sender", {})
             sender_username = sender.get("username", "")
             sender_user_id = sender.get("user_id", 0)
             content = body.get("content", "")
+            
+            logger.info(f"Chat message from {sender_username}: {content}")
             
             content_lower = content.lower().strip()
             response_message = None
@@ -1612,7 +1629,9 @@ async def kick_webhook(request: Request):
                 await award_points_for_chat(sender_username, sender_user_id)
             
             if response_message:
-                await send_kick_chat_message(response_message)
+                logger.info(f"Sending response: {response_message}")
+                result = await send_kick_chat_message(response_message)
+                logger.info(f"Message send result: {result}")
         
         return {"status": "ok"}
     except Exception as e:
