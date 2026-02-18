@@ -1168,6 +1168,64 @@ async def admin_bot_revoke(username: str = Depends(verify_admin)):
     await db.settings.delete_one({"type": "bot_tokens"})
     return {"success": True, "message": "Bot authorization revoked"}
 
+@api_router.post("/admin/bot/subscribe-events")
+async def admin_bot_subscribe_events(username: str = Depends(verify_admin)):
+    """Manually subscribe to Kick webhook events"""
+    access_token = await get_bot_access_token()
+    if not access_token:
+        raise HTTPException(status_code=400, detail="Bot not authorized")
+    
+    webhook_url = f"https://backend-pez.vercel.app/api/webhook/kick"
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": "application/json"
+            }
+            
+            # First check current subscriptions
+            check_response = await client.get(
+                "https://api.kick.com/public/v1/events/subscriptions",
+                headers=headers
+            )
+            logger.info(f"Current subscriptions: {check_response.status_code} - {check_response.text}")
+            
+            # Subscribe to chat events
+            payload = {
+                "events": [
+                    {"name": "chat.message.sent", "version": 1}
+                ],
+                "method": "webhook",
+                "webhook_url": webhook_url
+            }
+            
+            response = await client.post(
+                "https://api.kick.com/public/v1/events/subscriptions",
+                headers=headers,
+                json=payload
+            )
+            
+            logger.info(f"Subscribe response: {response.status_code} - {response.text}")
+            
+            if response.status_code in [200, 201]:
+                return {
+                    "success": True,
+                    "message": "Successfully subscribed to chat events",
+                    "webhook_url": webhook_url,
+                    "response": response.json() if response.text else {}
+                }
+            else:
+                return {
+                    "success": False,
+                    "message": f"Failed to subscribe: {response.status_code}",
+                    "error": response.text,
+                    "webhook_url": webhook_url
+                }
+    except Exception as e:
+        logger.error(f"Error subscribing to events: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 # ==================== EARNING RATES ====================
 
