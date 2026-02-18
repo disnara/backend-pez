@@ -1822,7 +1822,18 @@ async def kick_webhook(request: Request):
             elif content_lower == "!rank":
                 response_message = await handle_rank_command(sender_username)
             elif content_lower in ["!commands", "!help"]:
-                response_message = "Commands: !points | !rank | !leaderboard | Owner: !tip !addpoints !removepoints !setpoints !ban !unban"
+                response_message = "Commands: !points | !rank | !leaderboard | !site | !menace | !meta | !bit | !discord"
+            # Custom promo commands
+            elif content_lower == "!site":
+                response_message = "🎁 Check out our rewards site! 👉 https://pezrewards.com/"
+            elif content_lower == "!menace":
+                response_message = "🎰 MENACE $1500 BI-WEEKLY LEADERBOARD! Double Rank-Up Rewards, VIP Transfers, Lossback, Fast Payouts - all live right now. https://menace.com/?r=pez"
+            elif content_lower == "!meta":
+                response_message = "🔥$3,200 USD Monthly Leaderboard! DOUBLE Rank-Up Rewards, up to 120% Rakeback, Monthly Deposit Comps! 🎉 Sign up & Support now 👉 https://metaspins.com/?ref=pezslaps"
+            elif content_lower == "!bit":
+                response_message = "5K LEADERBOARD 🏁 | 20K WEEKLY RACE 🏆 | VIP Transfers 💎 | DOUBLE Rank-Up Rewards 🚀 https://join.bitfortune.com/pezslaps"
+            elif content_lower == "!discord":
+                response_message = "💬 Join the Discord to stay up to date, connect with the community, and enter giveaways! 🎁 👉 https://discord.gg/TRThDgz77W"
             else:
                 await award_points_for_chat(sender_username, sender_user_id)
             
