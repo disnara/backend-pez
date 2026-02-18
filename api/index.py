@@ -1673,6 +1673,29 @@ async def admin_find_all_duplicates(username: str = Depends(verify_admin)):
         "action": "Use /admin/merge-duplicate-users/{username} to fix each one, or /admin/merge-all-duplicates to fix all at once"
     }
 
+@api_router.delete("/admin/cleanup-null-users")
+async def admin_cleanup_null_users(username: str = Depends(verify_admin)):
+    """
+    Delete all user records with null/empty usernames (junk data from failed logins).
+    """
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Delete users with null or empty kick_username
+    result = await db.users.delete_many({
+        "$or": [
+            {"kick_username": None},
+            {"kick_username": ""},
+            {"kick_username": {"$exists": False}}
+        ]
+    })
+    
+    return {
+        "success": True,
+        "message": f"Cleaned up {result.deleted_count} junk records",
+        "deleted_count": result.deleted_count
+    }
+
 @api_router.post("/admin/merge-all-duplicates")
 async def admin_merge_all_duplicates(username: str = Depends(verify_admin)):
     """
