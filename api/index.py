@@ -1557,6 +1557,188 @@ async def admin_get_alt_accounts(username: str = Depends(verify_admin)):
         return {"success": True, "alt_groups": []}
 
 
+# ==================== DATABASE DIAGNOSTICS ====================
+
+@api_router.get("/admin/diagnose-user/{kick_username}")
+async def admin_diagnose_user(kick_username: str, username: str = Depends(verify_admin)):
+    """
+    Diagnose points mismatch for a user.
+    Finds ALL records matching this username to detect duplicates.
+    """
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Find ALL users matching this username (case-insensitive)
+    cursor = db.users.find(
+        {"kick_username": {"$regex": f"^{kick_username}$", "$options": "i"}},
+        {"_id": 0, "id": 1, "kick_id": 1, "kick_user_id": 1, "kick_username": 1, 
+         "points_balance": 1, "total_earned": 1, "registered_at": 1, "last_login": 1}
+    )
+    users = await cursor.to_list(length=100)
+    
+    return {
+        "success": True,
+        "search_username": kick_username,
+        "records_found": len(users),
+        "is_duplicate": len(users) > 1,
+        "users": users,
+        "diagnosis": "DUPLICATE USERS FOUND - Need to merge!" if len(users) > 1 else "Single user record OK"
+    }
+
+@api_router.post("/admin/merge-duplicate-users/{kick_username}")
+async def admin_merge_duplicate_users(kick_username: str, username: str = Depends(verify_admin)):
+    """
+    Merge duplicate user records into one.
+    Keeps the record with the highest points and adds points from others.
+    """
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Find ALL users matching this username
+    cursor = db.users.find(
+        {"kick_username": {"$regex": f"^{kick_username}$", "$options": "i"}},
+        {"_id": 1, "id": 1, "kick_id": 1, "kick_user_id": 1, "kick_username": 1, 
+         "points_balance": 1, "total_earned": 1, "registered_at": 1}
+    )
+    users = await cursor.to_list(length=100)
+    
+    if len(users) <= 1:
+        return {"success": True, "message": "No duplicates found for this user", "records": len(users)}
+    
+    # Sort by points_balance descending - keep the one with most points as primary
+    users.sort(key=lambda x: x.get("points_balance", 0), reverse=True)
+    primary = users[0]
+    duplicates = users[1:]
+    
+    # Calculate total points from all records
+    total_points = sum(u.get("points_balance", 0) for u in users)
+    total_earned = sum(u.get("total_earned", 0) for u in users)
+    
+    # Update primary record with combined points
+    await db.users.update_one(
+        {"_id": primary["_id"]},
+        {"$set": {
+            "points_balance": total_points,
+            "total_earned": total_earned,
+            "kick_user_id": primary.get("kick_id") or primary.get("kick_user_id")  # Ensure kick_user_id is set
+        }}
+    )
+    
+    # Delete duplicate records
+    duplicate_ids = [u["_id"] for u in duplicates]
+    delete_result = await db.users.delete_many({"_id": {"$in": duplicate_ids}})
+    
+    return {
+        "success": True,
+        "message": f"Merged {len(users)} records into 1",
+        "primary_user_id": primary.get("id"),
+        "duplicates_deleted": delete_result.deleted_count,
+        "new_total_points": total_points,
+        "new_total_earned": total_earned
+    }
+
+@api_router.get("/admin/find-all-duplicates")
+async def admin_find_all_duplicates(username: str = Depends(verify_admin)):
+    """
+    Find ALL users with duplicate records in the database.
+    Returns list of usernames that have more than one record.
+    """
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Aggregation to find duplicate usernames
+    pipeline = [
+        {"$group": {
+            "_id": {"$toLower": "$kick_username"},
+            "count": {"$sum": 1},
+            "total_points": {"$sum": "$points_balance"},
+            "records": {"$push": {
+                "id": "$id",
+                "kick_username": "$kick_username",
+                "points_balance": "$points_balance",
+                "kick_id": "$kick_id",
+                "kick_user_id": "$kick_user_id"
+            }}
+        }},
+        {"$match": {"count": {"$gt": 1}}},
+        {"$sort": {"count": -1}}
+    ]
+    
+    duplicates = await db.users.aggregate(pipeline).to_list(length=500)
+    
+    return {
+        "success": True,
+        "total_users_with_duplicates": len(duplicates),
+        "duplicates": duplicates,
+        "action": "Use /admin/merge-duplicate-users/{username} to fix each one, or /admin/merge-all-duplicates to fix all at once"
+    }
+
+@api_router.post("/admin/merge-all-duplicates")
+async def admin_merge_all_duplicates(username: str = Depends(verify_admin)):
+    """
+    Automatically merge ALL duplicate user records.
+    For each duplicate set, keeps highest points record and combines all points.
+    """
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Find all duplicates
+    pipeline = [
+        {"$group": {
+            "_id": {"$toLower": "$kick_username"},
+            "count": {"$sum": 1},
+            "records": {"$push": {
+                "_id": "$_id",
+                "id": "$id",
+                "kick_id": "$kick_id",
+                "points_balance": "$points_balance",
+                "total_earned": "$total_earned"
+            }}
+        }},
+        {"$match": {"count": {"$gt": 1}}}
+    ]
+    
+    duplicates = await db.users.aggregate(pipeline).to_list(length=500)
+    
+    merged_count = 0
+    deleted_count = 0
+    
+    for dup in duplicates:
+        records = dup["records"]
+        # Sort by points descending
+        records.sort(key=lambda x: x.get("points_balance", 0), reverse=True)
+        primary = records[0]
+        others = records[1:]
+        
+        # Calculate totals
+        total_points = sum(r.get("points_balance", 0) for r in records)
+        total_earned = sum(r.get("total_earned", 0) for r in records)
+        
+        # Update primary
+        await db.users.update_one(
+            {"_id": primary["_id"]},
+            {"$set": {
+                "points_balance": total_points,
+                "total_earned": total_earned,
+                "kick_user_id": primary.get("kick_id")
+            }}
+        )
+        
+        # Delete others
+        other_ids = [r["_id"] for r in others]
+        result = await db.users.delete_many({"_id": {"$in": other_ids}})
+        
+        merged_count += 1
+        deleted_count += result.deleted_count
+    
+    return {
+        "success": True,
+        "message": f"Merged {merged_count} duplicate user sets, deleted {deleted_count} extra records",
+        "users_merged": merged_count,
+        "records_deleted": deleted_count
+    }
+
+
 # ==================== DATABASE MIGRATION ====================
 
 @api_router.post("/admin/migrate-kick-user-ids")
