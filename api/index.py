@@ -594,13 +594,16 @@ async def kick_login(request: Request):
     return {"auth_url": auth_url}
 
 @api_router.get("/auth/callback/kick")
-async def kick_callback(request: Request, code: str = None, state: str = None, error: str = None):
+async def kick_callback(request: Request, code: str = None, state: str = None, error: str = None, error_description: str = None):
     is_bot_auth = state and state.startswith("bot_")
+    
+    # Log the callback for debugging
+    logger.info(f"Kick callback received - code: {bool(code)}, state: {bool(state)}, error: {error}, error_desc: {error_description}")
     
     if error:
         if is_bot_auth:
             return RedirectResponse(url=f"{FRONTEND_URL}/admin/dashboard.html?bot_error={error}")
-        return RedirectResponse(url=f"{FRONTEND_URL}/?error=auth_failed")
+        return RedirectResponse(url=f"{FRONTEND_URL}/?error={error}&desc={error_description or 'unknown'}")
     
     if not code or not state:
         if is_bot_auth:
@@ -609,10 +612,12 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
     
     # Retrieve from MongoDB
     code_verifier = await get_pkce(state)
+    logger.info(f"PKCE lookup - state: {state[:10]}..., found: {bool(code_verifier)}")
+    
     if not code_verifier:
         if is_bot_auth:
             return RedirectResponse(url=f"{FRONTEND_URL}/admin/dashboard.html?bot_error=invalid_state")
-        return RedirectResponse(url=f"{FRONTEND_URL}/?error=invalid_state")
+        return RedirectResponse(url=f"{FRONTEND_URL}/?error=invalid_state_pkce_not_found")
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as http_client:
