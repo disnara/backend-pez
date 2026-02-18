@@ -65,6 +65,149 @@ async def get_earning_rates():
         "cooldown_seconds": DEFAULT_COOLDOWN_SECONDS
     }
 
+# ==================== TOKEN REFRESH HELPER ====================
+
+async def refresh_kick_token(token_type: str = "channel_tokens"):
+    """
+    Refresh Kick OAuth token using refresh_token.
+    token_type: "channel_tokens" or "bot_tokens"
+    Returns new access_token or None if refresh failed.
+    """
+    if db is None:
+        logger.error("Database not available for token refresh")
+        return None
+    
+    tokens = await db.settings.find_one({"type": token_type})
+    if not tokens or not tokens.get("refresh_token"):
+        logger.error(f"No refresh token found for {token_type}")
+        return None
+    
+    refresh_token = tokens.get("refresh_token")
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            token_response = await client.post(
+                "https://id.kick.com/oauth/token",
+                data={
+                    "grant_type": "refresh_token",
+                    "client_id": KICK_CLIENT_ID,
+                    "client_secret": KICK_CLIENT_SECRET,
+                    "refresh_token": refresh_token
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"}
+            )
+            
+            logger.info(f"Token refresh response for {token_type}: {token_response.status_code}")
+            
+            if token_response.status_code == 200:
+                token_data = token_response.json()
+                new_access_token = token_data.get("access_token")
+                new_refresh_token = token_data.get("refresh_token", refresh_token)
+                expires_in = token_data.get("expires_in", 3600)
+                
+                # Update tokens in database
+                await db.settings.update_one(
+                    {"type": token_type},
+                    {"$set": {
+                        "access_token": new_access_token,
+                        "refresh_token": new_refresh_token,
+                        "expires_in": expires_in,
+                        "refreshed_at": datetime.now(timezone.utc).isoformat()
+                    }}
+                )
+                
+                logger.info(f"Successfully refreshed {token_type}")
+                return new_access_token
+            else:
+                logger.error(f"Token refresh failed: {token_response.status_code} - {token_response.text}")
+                return None
+                
+    except Exception as e:
+        logger.error(f"Error refreshing token: {e}")
+        return None
+
+async def get_valid_channel_token():
+    """
+    Get a valid channel access token, refreshing if necessary.
+    Returns (access_token, user_id) or (None, None) if failed.
+    """
+    if db is None:
+        return None, None
+    
+    channel_tokens = await db.settings.find_one({"type": "channel_tokens"})
+    if not channel_tokens:
+        return None, None
+    
+    access_token = channel_tokens.get("access_token")
+    user_id = channel_tokens.get("user_id")
+    
+    # Try to use current token first by making a test request
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            test_response = await client.get(
+                "https://api.kick.com/public/v1/users",
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            
+            if test_response.status_code == 200:
+                # Token is still valid
+                return access_token, user_id
+            elif test_response.status_code == 401:
+                # Token expired, try to refresh
+                logger.info("Channel token expired, attempting refresh...")
+                new_token = await refresh_kick_token("channel_tokens")
+                if new_token:
+                    return new_token, user_id
+                else:
+                    return None, user_id
+            else:
+                logger.warning(f"Unexpected response testing token: {test_response.status_code}")
+                return access_token, user_id
+                
+    except Exception as e:
+        logger.error(f"Error testing token: {e}")
+        # Return existing token, let the actual request handle the error
+        return access_token, user_id
+
+async def get_valid_bot_token():
+    """
+    Get a valid bot access token, refreshing if necessary.
+    Returns (access_token, user_id) or (None, None) if failed.
+    """
+    if db is None:
+        return None, None
+    
+    bot_tokens = await db.settings.find_one({"type": "bot_tokens"})
+    if not bot_tokens:
+        return None, None
+    
+    access_token = bot_tokens.get("access_token")
+    user_id = bot_tokens.get("user_id")
+    
+    # Try to use current token first
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            test_response = await client.get(
+                "https://api.kick.com/public/v1/users",
+                headers={"Authorization": f"Bearer {access_token}"}
+            )
+            
+            if test_response.status_code == 200:
+                return access_token, user_id
+            elif test_response.status_code == 401:
+                logger.info("Bot token expired, attempting refresh...")
+                new_token = await refresh_kick_token("bot_tokens")
+                if new_token:
+                    return new_token, user_id
+                else:
+                    return None, user_id
+            else:
+                return access_token, user_id
+                
+    except Exception as e:
+        logger.error(f"Error testing bot token: {e}")
+        return access_token, user_id
+
 # Create the main app
 app = FastAPI()
 
@@ -1235,19 +1378,21 @@ async def admin_channel_revoke(username: str = Depends(verify_admin)):
 
 @api_router.post("/admin/bot/subscribe-events")
 async def admin_bot_subscribe_events(username: str = Depends(verify_admin)):
-    """Subscribe to chat events using channel token"""
+    """Subscribe to chat events using channel token with automatic token refresh"""
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available")
     
-    # Get CHANNEL token (for subscribing to events)
-    channel_tokens = await db.settings.find_one({"type": "channel_tokens"})
-    if not channel_tokens or not channel_tokens.get("access_token"):
-        raise HTTPException(status_code=400, detail="Channel account not authorized. Please authorize the channel first.")
+    # Get valid channel token (with automatic refresh if expired)
+    access_token, broadcaster_id = await get_valid_channel_token()
     
-    access_token = channel_tokens.get("access_token")
-    broadcaster_id = channel_tokens.get("user_id")
+    if not access_token:
+        raise HTTPException(
+            status_code=400, 
+            detail="Channel token expired and refresh failed. Please re-authorize the channel account."
+        )
     
     webhook_url = "https://backend-pez.vercel.app/api/webhook/kick"
+    token_was_refreshed = False
     
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
@@ -1262,6 +1407,26 @@ async def admin_bot_subscribe_events(username: str = Depends(verify_admin)):
                 headers=headers
             )
             logger.info(f"Current subscriptions: {check_response.status_code} - {check_response.text}")
+            
+            # If 401, try refreshing token
+            if check_response.status_code == 401:
+                logger.info("Token rejected, attempting refresh...")
+                new_token = await refresh_kick_token("channel_tokens")
+                if new_token:
+                    access_token = new_token
+                    headers["Authorization"] = f"Bearer {access_token}"
+                    token_was_refreshed = True
+                    # Retry the request
+                    check_response = await client.get(
+                        "https://api.kick.com/public/v1/events/subscriptions",
+                        headers=headers
+                    )
+                else:
+                    raise HTTPException(
+                        status_code=401, 
+                        detail="Channel token expired and refresh failed. Please re-authorize the channel account."
+                    )
+            
             current_subs = check_response.json() if check_response.status_code == 200 else {}
             
             # Subscribe to chat events with broadcaster ID
@@ -1286,18 +1451,52 @@ async def admin_bot_subscribe_events(username: str = Depends(verify_admin)):
             
             logger.info(f"Subscribe response: {response.status_code} - {response.text}")
             
+            # If still 401 after refresh attempt, need re-authorization
+            if response.status_code == 401:
+                raise HTTPException(
+                    status_code=401,
+                    detail="Authorization failed. Please re-authorize the channel account from the admin panel."
+                )
+            
             return {
                 "success": response.status_code in [200, 201],
-                "message": "Subscription request sent",
+                "message": "Subscription request sent" + (" (token was refreshed)" if token_was_refreshed else ""),
                 "webhook_url": webhook_url,
                 "broadcaster_id": broadcaster_id,
                 "subscribe_status": response.status_code,
                 "subscribe_response": response.json() if response.text else {},
-                "current_subscriptions": current_subs
+                "current_subscriptions": current_subs,
+                "token_refreshed": token_was_refreshed
             }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error subscribing to events: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.post("/admin/channel/refresh-token")
+async def admin_channel_refresh_token(username: str = Depends(verify_admin)):
+    """Manually refresh channel token"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    new_token = await refresh_kick_token("channel_tokens")
+    if new_token:
+        return {"success": True, "message": "Channel token refreshed successfully"}
+    else:
+        raise HTTPException(status_code=400, detail="Failed to refresh token. Please re-authorize the channel.")
+
+@api_router.post("/admin/bot/refresh-token")
+async def admin_bot_refresh_token(username: str = Depends(verify_admin)):
+    """Manually refresh bot token"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    new_token = await refresh_kick_token("bot_tokens")
+    if new_token:
+        return {"success": True, "message": "Bot token refreshed successfully"}
+    else:
+        raise HTTPException(status_code=400, detail="Failed to refresh token. Please re-authorize the bot.")
 
 
 # ==================== EARNING RATES ====================
@@ -1488,9 +1687,10 @@ async def get_bot_access_token():
     return None
 
 async def send_kick_chat_message(message: str):
-    access_token = await get_bot_access_token()
+    """Send chat message using bot token with automatic refresh"""
+    access_token, bot_user_id = await get_valid_bot_token()
     if not access_token:
-        logger.error("No bot access token found")
+        logger.error("No valid bot access token found")
         return False
     
     try:
@@ -1507,9 +1707,7 @@ async def send_kick_chat_message(message: str):
                 
                 # Fallback to bot_tokens if no channel_tokens
                 if not broadcaster_id:
-                    bot_settings = await db.settings.find_one({"type": "bot_tokens"})
-                    if bot_settings:
-                        broadcaster_id = bot_settings.get("user_id")
+                    broadcaster_id = bot_user_id
             
             if not broadcaster_id:
                 logger.error("No broadcaster_id found for chat message")
@@ -1523,6 +1721,15 @@ async def send_kick_chat_message(message: str):
             
             logger.info(f"Sending chat message to broadcaster {broadcaster_id}: {message[:50]}...")
             response = await client.post("https://api.kick.com/public/v1/chat", headers=headers, json=payload)
+            
+            # If 401, try refreshing token and retry
+            if response.status_code == 401:
+                logger.info("Bot token expired during send, refreshing...")
+                new_token = await refresh_kick_token("bot_tokens")
+                if new_token:
+                    headers["Authorization"] = f"Bearer {new_token}"
+                    response = await client.post("https://api.kick.com/public/v1/chat", headers=headers, json=payload)
+            
             logger.info(f"Chat API response: {response.status_code} - {response.text[:200] if response.text else 'empty'}")
             return response.status_code in [200, 201]
     except Exception as e:
