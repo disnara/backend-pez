@@ -1475,12 +1475,19 @@ async def send_kick_chat_message(message: str):
         async with httpx.AsyncClient() as client:
             headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
             
-            # Get the channel/broadcaster ID from settings
+            # Get the CHANNEL's broadcaster ID (where to send the message)
             broadcaster_id = None
             if db is not None:
-                bot_settings = await db.settings.find_one({"type": "bot_tokens"})
-                if bot_settings:
-                    broadcaster_id = bot_settings.get("user_id") or bot_settings.get("broadcaster_id")
+                # First try channel_tokens (the channel we're monitoring)
+                channel_settings = await db.settings.find_one({"type": "channel_tokens"})
+                if channel_settings:
+                    broadcaster_id = channel_settings.get("user_id")
+                
+                # Fallback to bot_tokens if no channel_tokens
+                if not broadcaster_id:
+                    bot_settings = await db.settings.find_one({"type": "bot_tokens"})
+                    if bot_settings:
+                        broadcaster_id = bot_settings.get("user_id")
             
             if not broadcaster_id:
                 logger.error("No broadcaster_id found for chat message")
