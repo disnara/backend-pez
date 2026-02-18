@@ -1143,7 +1143,8 @@ async def admin_bot_authorize(username: str = Depends(verify_admin)):
     code_verifier = generate_code_verifier()
     code_challenge = generate_code_challenge(code_verifier)
     
-    pkce_store[state] = code_verifier
+    # Store in MongoDB for serverless compatibility
+    await store_pkce(state, code_verifier)
     
     params = {
         "client_id": KICK_CLIENT_ID,
