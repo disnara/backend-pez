@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, Request, Response, Query
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.responses import RedirectResponse, JSONResponse
 from starlette.middleware.cors import CORSMiddleware
@@ -6,12 +6,15 @@ from motor.motor_asyncio import AsyncIOMotorClient
 import os
 import logging
 from pydantic import BaseModel, Field, ConfigDict
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
+from enum import Enum
 import uuid
 import secrets
 from datetime import datetime, timezone, timedelta
 import httpx
 import hashlib
+import hmac
+import binascii
 import jwt
 import urllib.parse
 
@@ -2567,6 +2570,1182 @@ async def kick_webhook(request: Request):
 @api_router.get("/webhook/kick")
 async def kick_webhook_verify():
     return {"status": "ok", "message": "Webhook endpoint active"}
+
+
+
+# ============================================
+# PROVABLY FAIR CASINO GAMES SYSTEM
+# ============================================
+
+# Game Constants
+GAME_HOUSE_EDGE = 0.01  # 1% house edge
+MAX_BET_AMOUNT = 100000  # Maximum bet amount
+
+class GameTypeEnum(str, Enum):
+    dice = "dice"
+    limbo = "limbo"
+    mines = "mines"
+    blackjack = "blackjack"
+
+# Pydantic Models for Games
+class InitSeedsRequest(BaseModel):
+    client_seed: Optional[str] = None
+
+class DiceBetRequest(BaseModel):
+    bet_amount: float = Field(..., gt=0, le=MAX_BET_AMOUNT)
+    target: float = Field(..., ge=1, le=98)
+    roll_over: bool = True
+
+class LimboBetRequest(BaseModel):
+    bet_amount: float = Field(..., gt=0, le=MAX_BET_AMOUNT)
+    target_multiplier: float = Field(..., ge=1.01, le=1000000)
+
+class MinesStartRequest(BaseModel):
+    bet_amount: float = Field(..., gt=0, le=MAX_BET_AMOUNT)
+    num_mines: int = Field(..., ge=1, le=24)
+
+class MinesRevealRequest(BaseModel):
+    session_id: str
+    tile_index: int = Field(..., ge=0, le=24)
+
+class MinesCashoutRequest(BaseModel):
+    session_id: str
+
+class BlackjackStartRequest(BaseModel):
+    bet_amount: float = Field(..., gt=0, le=MAX_BET_AMOUNT)
+
+class BlackjackActionRequest(BaseModel):
+    session_id: str
+    action: str  # hit, stand, double
+
+class VerifyGameRequest(BaseModel):
+    server_seed: str
+    server_seed_hashed: str
+    client_seed: str
+    nonce: int
+    game_type: GameTypeEnum
+    game_params: Optional[dict] = {}
+
+# ============================================
+# PROVABLY FAIR CORE FUNCTIONS
+# ============================================
+
+def generate_server_seed() -> str:
+    """Generate a cryptographically secure 32-byte server seed"""
+    return binascii.hexlify(secrets.token_bytes(32)).decode('utf-8')
+
+def hash_server_seed(server_seed: str) -> str:
+    """Hash server seed with SHA-256 (shown to player before game)"""
+    return hashlib.sha256(server_seed.encode()).hexdigest()
+
+def generate_hmac_result(server_seed: str, client_seed: str, nonce: int) -> str:
+    """Generate HMAC-SHA512 hash from seeds and nonce"""
+    message = f"{client_seed}:{nonce}".encode()
+    return hmac.new(server_seed.encode(), message, hashlib.sha512).hexdigest()
+
+def hmac_to_float(hmac_hex: str, offset: int = 0) -> float:
+    """Convert HMAC bytes to float [0, 1) for game outcomes"""
+    hex_slice = hmac_hex[offset*2:(offset+4)*2]
+    value = int(hex_slice, 16)
+    return value / (16 ** 8)
+
+def calculate_dice_result(server_seed: str, client_seed: str, nonce: int) -> float:
+    """Calculate dice roll result (0.00 - 99.99)"""
+    hmac_hex = generate_hmac_result(server_seed, client_seed, nonce)
+    float_value = hmac_to_float(hmac_hex)
+    return round(float_value * 100, 2)
+
+def calculate_limbo_result(server_seed: str, client_seed: str, nonce: int) -> float:
+    """Calculate limbo multiplier (1.00 - 1000000x)"""
+    hmac_hex = generate_hmac_result(server_seed, client_seed, nonce)
+    float_value = hmac_to_float(hmac_hex)
+    
+    if float_value == 0:
+        return 1000000.00
+    
+    multiplier = (1 - GAME_HOUSE_EDGE) / float_value
+    multiplier = min(multiplier, 1000000.0)
+    multiplier = max(multiplier, 1.0)
+    
+    return round(multiplier, 2)
+
+def calculate_mines_grid(server_seed: str, client_seed: str, nonce: int, num_mines: int, grid_size: int = 25) -> list:
+    """Calculate mine positions for mines game"""
+    hmac_hex = generate_hmac_result(server_seed, client_seed, nonce)
+    positions = list(range(grid_size))
+    
+    for i in range(grid_size - 1, 0, -1):
+        byte_offset = (grid_size - 1 - i) * 4
+        if byte_offset + 8 > len(hmac_hex):
+            extended_hmac = generate_hmac_result(server_seed, f"{client_seed}:ext", nonce)
+            hmac_hex += extended_hmac
+        
+        hex_slice = hmac_hex[byte_offset:byte_offset+8]
+        j = int(hex_slice, 16) % (i + 1)
+        positions[i], positions[j] = positions[j], positions[i]
+    
+    return sorted(positions[:num_mines])
+
+def calculate_blackjack_deck(server_seed: str, client_seed: str, nonce: int) -> list:
+    """Generate shuffled deck for blackjack"""
+    hmac_hex = generate_hmac_result(server_seed, client_seed, nonce)
+    
+    suits = ['hearts', 'diamonds', 'clubs', 'spades']
+    values = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K']
+    
+    deck = []
+    for suit in suits:
+        for value in values:
+            deck.append({'suit': suit, 'value': value})
+    
+    for i in range(51, 0, -1):
+        byte_offset = (51 - i) * 4
+        if byte_offset + 8 > len(hmac_hex):
+            extended_hmac = generate_hmac_result(server_seed, f"{client_seed}:deck", nonce)
+            hmac_hex += extended_hmac
+        
+        hex_slice = hmac_hex[byte_offset:byte_offset+8]
+        j = int(hex_slice, 16) % (i + 1)
+        deck[i], deck[j] = deck[j], deck[i]
+    
+    return deck
+
+def get_card_value(card: dict) -> int:
+    """Get blackjack value of a card"""
+    value = card['value']
+    if value in ['J', 'Q', 'K']:
+        return 10
+    if value == 'A':
+        return 11
+    return int(value)
+
+def calculate_hand_value(cards: list) -> int:
+    """Calculate blackjack hand value, handling aces"""
+    total = sum(get_card_value(card) for card in cards)
+    aces = sum(1 for card in cards if card['value'] == 'A')
+    
+    while total > 21 and aces > 0:
+        total -= 10
+        aces -= 1
+    
+    return total
+
+def calculate_dice_multiplier(win_chance: float) -> float:
+    """Calculate payout multiplier for dice based on win chance"""
+    if win_chance <= 0 or win_chance >= 100:
+        return 0
+    multiplier = (100 * (1 - GAME_HOUSE_EDGE)) / win_chance
+    return round(multiplier, 4)
+
+def calculate_mines_multiplier(revealed: int, num_mines: int, grid_size: int = 25) -> float:
+    """Calculate current multiplier for mines game"""
+    if revealed == 0:
+        return 1.0
+    
+    safe_tiles = grid_size - num_mines
+    multiplier = 1.0
+    
+    for i in range(revealed):
+        remaining_safe = safe_tiles - i
+        remaining_total = grid_size - i
+        if remaining_safe <= 0:
+            return 0
+        prob = remaining_safe / remaining_total
+        multiplier *= (1 / prob) * (1 - GAME_HOUSE_EDGE)
+    
+    return round(multiplier, 4)
+
+def verify_game_result(server_seed: str, server_seed_hashed: str, client_seed: str, nonce: int, game_type: str, game_params: dict) -> Dict[str, Any]:
+    """Verify a game result is fair"""
+    calculated_hash = hash_server_seed(server_seed)
+    hash_valid = calculated_hash == server_seed_hashed
+    
+    if game_type == "dice":
+        result = calculate_dice_result(server_seed, client_seed, nonce)
+    elif game_type == "limbo":
+        result = calculate_limbo_result(server_seed, client_seed, nonce)
+    elif game_type == "mines":
+        result = calculate_mines_grid(server_seed, client_seed, nonce, game_params.get('num_mines', 3))
+    elif game_type == "blackjack":
+        result = calculate_blackjack_deck(server_seed, client_seed, nonce)
+    else:
+        result = None
+    
+    return {
+        'hash_valid': hash_valid,
+        'calculated_hash': calculated_hash,
+        'provided_hash': server_seed_hashed,
+        'recalculated_result': result,
+        'hmac': generate_hmac_result(server_seed, client_seed, nonce)
+    }
+
+# ============================================
+# GAME SEED MANAGEMENT ENDPOINTS
+# ============================================
+
+@api_router.post("/games/seeds/init")
+async def initialize_seeds(request_data: InitSeedsRequest, request: Request):
+    """Initialize or get user's provably fair seeds"""
+    user = await get_current_user(request)
+    user_id = str(user['id'])
+    
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    existing = await db.user_seeds.find_one({"user_id": user_id})
+    
+    if existing:
+        return {
+            "success": True,
+            "server_seed_hashed": existing['server_seed_hashed'],
+            "next_server_seed_hashed": existing['next_server_seed_hashed'],
+            "client_seed": existing['client_seed'],
+            "nonce": existing['nonce']
+        }
+    
+    server_seed = generate_server_seed()
+    next_server_seed = generate_server_seed()
+    client_seed = request_data.client_seed or f"pez_{user_id}_{int(datetime.now().timestamp())}"
+    
+    seed_doc = {
+        "user_id": user_id,
+        "server_seed": server_seed,
+        "server_seed_hashed": hash_server_seed(server_seed),
+        "next_server_seed": next_server_seed,
+        "next_server_seed_hashed": hash_server_seed(next_server_seed),
+        "client_seed": client_seed,
+        "nonce": 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+    
+    await db.user_seeds.insert_one(seed_doc)
+    
+    return {
+        "success": True,
+        "server_seed_hashed": seed_doc['server_seed_hashed'],
+        "next_server_seed_hashed": seed_doc['next_server_seed_hashed'],
+        "client_seed": seed_doc['client_seed'],
+        "nonce": seed_doc['nonce']
+    }
+
+@api_router.post("/games/seeds/rotate")
+async def rotate_seeds(request_data: InitSeedsRequest, request: Request):
+    """Rotate seeds - reveals old server seed, generates new one"""
+    user = await get_current_user(request)
+    user_id = str(user['id'])
+    
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    existing = await db.user_seeds.find_one({"user_id": user_id})
+    if not existing:
+        raise HTTPException(status_code=400, detail="No seeds found. Call /games/seeds/init first")
+    
+    old_server_seed = existing['server_seed']
+    old_server_seed_hashed = existing['server_seed_hashed']
+    
+    new_next_server_seed = generate_server_seed()
+    new_client_seed = request_data.client_seed or existing['client_seed']
+    
+    await db.user_seeds.update_one(
+        {"user_id": user_id},
+        {"$set": {
+            "server_seed": existing['next_server_seed'],
+            "server_seed_hashed": existing['next_server_seed_hashed'],
+            "next_server_seed": new_next_server_seed,
+            "next_server_seed_hashed": hash_server_seed(new_next_server_seed),
+            "client_seed": new_client_seed,
+            "nonce": 0,
+            "updated_at": datetime.now(timezone.utc).isoformat()
+        }}
+    )
+    
+    return {
+        "success": True,
+        "revealed_server_seed": old_server_seed,
+        "revealed_server_seed_hashed": old_server_seed_hashed,
+        "new_server_seed_hashed": existing['next_server_seed_hashed'],
+        "next_server_seed_hashed": hash_server_seed(new_next_server_seed),
+        "client_seed": new_client_seed,
+        "nonce": 0
+    }
+
+@api_router.put("/games/seeds/client")
+async def update_client_seed(request_data: InitSeedsRequest, request: Request):
+    """Update client seed"""
+    user = await get_current_user(request)
+    user_id = str(user['id'])
+    
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    if not request_data.client_seed:
+        raise HTTPException(status_code=400, detail="client_seed is required")
+    
+    result = await db.user_seeds.update_one(
+        {"user_id": user_id},
+        {"$set": {"client_seed": request_data.client_seed, "updated_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=400, detail="No seeds found")
+    
+    return {"success": True, "client_seed": request_data.client_seed}
+
+# ============================================
+# DICE GAME ENDPOINT
+# ============================================
+
+@api_router.post("/games/dice/bet")
+async def play_dice(request_data: DiceBetRequest, request: Request):
+    """Place a dice bet"""
+    user = await get_current_user(request)
+    user_id = str(user['id'])
+    
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Check balance
+    db_user = await db.users.find_one({"id": user_id})
+    if not db_user or db_user.get('points_balance', 0) < request_data.bet_amount:
+        raise HTTPException(status_code=400, detail="Insufficient balance")
+    
+    # Get user seeds
+    seeds = await db.user_seeds.find_one({"user_id": user_id})
+    if not seeds:
+        raise HTTPException(status_code=400, detail="Please initialize seeds first")
+    
+    # Pre-calculate result
+    roll_result = calculate_dice_result(seeds['server_seed'], seeds['client_seed'], seeds['nonce'])
+    
+    # Calculate win chance and multiplier
+    if request_data.roll_over:
+        win_chance = 99.99 - request_data.target
+        won = roll_result > request_data.target
+    else:
+        win_chance = request_data.target
+        won = roll_result < request_data.target
+    
+    multiplier = calculate_dice_multiplier(win_chance)
+    payout = request_data.bet_amount * multiplier if won else 0
+    profit = payout - request_data.bet_amount
+    
+    # Update balance atomically
+    new_balance = db_user['points_balance'] - request_data.bet_amount + payout
+    await db.users.update_one({"id": user_id}, {"$set": {"points_balance": new_balance}})
+    
+    # Increment nonce
+    await db.user_seeds.update_one({"user_id": user_id}, {"$inc": {"nonce": 1}})
+    
+    # Save to history
+    history_doc = {
+        "user_id": user_id,
+        "kick_username": db_user.get("kick_username", "Unknown"),
+        "game_type": "dice",
+        "bet_amount": request_data.bet_amount,
+        "multiplier": multiplier if won else 0,
+        "payout": payout,
+        "profit": profit,
+        "server_seed": seeds['server_seed'],
+        "server_seed_hashed": seeds['server_seed_hashed'],
+        "client_seed": seeds['client_seed'],
+        "nonce": seeds['nonce'],
+        "game_data": {
+            "target": request_data.target,
+            "roll_over": request_data.roll_over,
+            "roll_result": roll_result,
+            "win_chance": win_chance,
+            "won": won
+        },
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.game_history.insert_one(history_doc)
+    
+    return {
+        "success": True,
+        "result": {
+            "roll": roll_result,
+            "target": request_data.target,
+            "roll_over": request_data.roll_over,
+            "won": won,
+            "multiplier": multiplier,
+            "payout": payout,
+            "profit": profit,
+            "new_balance": new_balance
+        },
+        "fairness": {
+            "server_seed_hashed": seeds['server_seed_hashed'],
+            "client_seed": seeds['client_seed'],
+            "nonce": seeds['nonce']
+        }
+    }
+
+# ============================================
+# LIMBO GAME ENDPOINT
+# ============================================
+
+@api_router.post("/games/limbo/bet")
+async def play_limbo(request_data: LimboBetRequest, request: Request):
+    """Place a limbo bet"""
+    user = await get_current_user(request)
+    user_id = str(user['id'])
+    
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    db_user = await db.users.find_one({"id": user_id})
+    if not db_user or db_user.get('points_balance', 0) < request_data.bet_amount:
+        raise HTTPException(status_code=400, detail="Insufficient balance")
+    
+    seeds = await db.user_seeds.find_one({"user_id": user_id})
+    if not seeds:
+        raise HTTPException(status_code=400, detail="Please initialize seeds first")
+    
+    result_multiplier = calculate_limbo_result(seeds['server_seed'], seeds['client_seed'], seeds['nonce'])
+    
+    won = result_multiplier >= request_data.target_multiplier
+    payout = request_data.bet_amount * request_data.target_multiplier if won else 0
+    profit = payout - request_data.bet_amount
+    
+    new_balance = db_user['points_balance'] - request_data.bet_amount + payout
+    await db.users.update_one({"id": user_id}, {"$set": {"points_balance": new_balance}})
+    await db.user_seeds.update_one({"user_id": user_id}, {"$inc": {"nonce": 1}})
+    
+    history_doc = {
+        "user_id": user_id,
+        "kick_username": db_user.get("kick_username", "Unknown"),
+        "game_type": "limbo",
+        "bet_amount": request_data.bet_amount,
+        "multiplier": request_data.target_multiplier if won else 0,
+        "payout": payout,
+        "profit": profit,
+        "server_seed": seeds['server_seed'],
+        "server_seed_hashed": seeds['server_seed_hashed'],
+        "client_seed": seeds['client_seed'],
+        "nonce": seeds['nonce'],
+        "game_data": {
+            "target_multiplier": request_data.target_multiplier,
+            "result_multiplier": result_multiplier,
+            "won": won
+        },
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.game_history.insert_one(history_doc)
+    
+    return {
+        "success": True,
+        "result": {
+            "result_multiplier": result_multiplier,
+            "target_multiplier": request_data.target_multiplier,
+            "won": won,
+            "payout": payout,
+            "profit": profit,
+            "new_balance": new_balance
+        },
+        "fairness": {
+            "server_seed_hashed": seeds['server_seed_hashed'],
+            "client_seed": seeds['client_seed'],
+            "nonce": seeds['nonce']
+        }
+    }
+
+# ============================================
+# MINES GAME ENDPOINTS
+# ============================================
+
+@api_router.post("/games/mines/start")
+async def start_mines(request_data: MinesStartRequest, request: Request):
+    """Start a new mines game"""
+    user = await get_current_user(request)
+    user_id = str(user['id'])
+    
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    db_user = await db.users.find_one({"id": user_id})
+    if not db_user or db_user.get('points_balance', 0) < request_data.bet_amount:
+        raise HTTPException(status_code=400, detail="Insufficient balance")
+    
+    # Check no active mines game
+    active_game = await db.game_sessions.find_one({"user_id": user_id, "game_type": "mines", "status": "in_progress"})
+    if active_game:
+        raise HTTPException(status_code=400, detail="You have an active mines game")
+    
+    seeds = await db.user_seeds.find_one({"user_id": user_id})
+    if not seeds:
+        raise HTTPException(status_code=400, detail="Please initialize seeds first")
+    
+    mine_positions = calculate_mines_grid(seeds['server_seed'], seeds['client_seed'], seeds['nonce'], request_data.num_mines)
+    
+    new_balance = db_user['points_balance'] - request_data.bet_amount
+    await db.users.update_one({"id": user_id}, {"$set": {"points_balance": new_balance}})
+    
+    session_id = str(uuid.uuid4())
+    session_doc = {
+        "session_id": session_id,
+        "user_id": user_id,
+        "kick_username": db_user.get("kick_username", "Unknown"),
+        "game_type": "mines",
+        "bet_amount": request_data.bet_amount,
+        "server_seed": seeds['server_seed'],
+        "server_seed_hashed": seeds['server_seed_hashed'],
+        "client_seed": seeds['client_seed'],
+        "nonce": seeds['nonce'],
+        "pre_calculated_result": mine_positions,
+        "game_state": {"num_mines": request_data.num_mines, "revealed_tiles": [], "safe_tiles_count": 25 - request_data.num_mines},
+        "status": "in_progress",
+        "multiplier": 1.0,
+        "payout": 0,
+        "profit": 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None
+    }
+    await db.game_sessions.insert_one(session_doc)
+    await db.user_seeds.update_one({"user_id": user_id}, {"$inc": {"nonce": 1}})
+    
+    return {
+        "success": True,
+        "session_id": session_id,
+        "num_mines": request_data.num_mines,
+        "bet_amount": request_data.bet_amount,
+        "new_balance": new_balance,
+        "current_multiplier": 1.0,
+        "fairness": {
+            "server_seed_hashed": seeds['server_seed_hashed'],
+            "client_seed": seeds['client_seed'],
+            "nonce": seeds['nonce']
+        }
+    }
+
+@api_router.post("/games/mines/reveal")
+async def reveal_mines_tile(request_data: MinesRevealRequest, request: Request):
+    """Reveal a tile in mines game"""
+    user = await get_current_user(request)
+    user_id = str(user['id'])
+    
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    session = await db.game_sessions.find_one({"session_id": request_data.session_id, "user_id": user_id, "status": "in_progress"})
+    if not session:
+        raise HTTPException(status_code=400, detail="No active game session found")
+    
+    tile_index = request_data.tile_index
+    mine_positions = session['pre_calculated_result']
+    revealed = session['game_state']['revealed_tiles']
+    
+    if tile_index in revealed:
+        raise HTTPException(status_code=400, detail="Tile already revealed")
+    
+    is_mine = tile_index in mine_positions
+    
+    if is_mine:
+        await db.game_sessions.update_one(
+            {"session_id": request_data.session_id},
+            {"$set": {
+                "status": "completed",
+                "game_state.revealed_tiles": revealed + [tile_index],
+                "multiplier": 0,
+                "payout": 0,
+                "profit": -session['bet_amount'],
+                "completed_at": datetime.now(timezone.utc).isoformat()
+            }}
+        )
+        
+        history_doc = {
+            "user_id": user_id,
+            "kick_username": session.get("kick_username", "Unknown"),
+            "game_type": "mines",
+            "bet_amount": session['bet_amount'],
+            "multiplier": 0,
+            "payout": 0,
+            "profit": -session['bet_amount'],
+            "server_seed": session['server_seed'],
+            "server_seed_hashed": session['server_seed_hashed'],
+            "client_seed": session['client_seed'],
+            "nonce": session['nonce'],
+            "game_data": {"num_mines": session['game_state']['num_mines'], "mine_positions": mine_positions, "revealed_tiles": revealed + [tile_index], "hit_mine": True},
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        await db.game_history.insert_one(history_doc)
+        
+        return {
+            "success": True,
+            "is_mine": True,
+            "game_over": True,
+            "tile_index": tile_index,
+            "mine_positions": mine_positions,
+            "payout": 0,
+            "profit": -session['bet_amount'],
+            "server_seed": session['server_seed']
+        }
+    
+    new_revealed = revealed + [tile_index]
+    num_revealed = len(new_revealed)
+    num_mines = session['game_state']['num_mines']
+    new_multiplier = calculate_mines_multiplier(num_revealed, num_mines)
+    
+    safe_tiles = 25 - num_mines
+    all_revealed = num_revealed >= safe_tiles
+    
+    if all_revealed:
+        payout = session['bet_amount'] * new_multiplier
+        profit = payout - session['bet_amount']
+        
+        db_user = await db.users.find_one({"id": user_id})
+        await db.users.update_one({"id": user_id}, {"$set": {"points_balance": db_user['points_balance'] + payout}})
+        
+        await db.game_sessions.update_one(
+            {"session_id": request_data.session_id},
+            {"$set": {
+                "status": "completed",
+                "game_state.revealed_tiles": new_revealed,
+                "multiplier": new_multiplier,
+                "payout": payout,
+                "profit": profit,
+                "completed_at": datetime.now(timezone.utc).isoformat()
+            }}
+        )
+        
+        updated_user = await db.users.find_one({"id": user_id})
+        
+        return {
+            "success": True,
+            "is_mine": False,
+            "game_over": True,
+            "all_safe_revealed": True,
+            "tile_index": tile_index,
+            "revealed_count": num_revealed,
+            "current_multiplier": new_multiplier,
+            "payout": payout,
+            "profit": profit,
+            "new_balance": updated_user['points_balance'],
+            "mine_positions": mine_positions,
+            "server_seed": session['server_seed']
+        }
+    
+    await db.game_sessions.update_one(
+        {"session_id": request_data.session_id},
+        {"$set": {"game_state.revealed_tiles": new_revealed, "multiplier": new_multiplier}}
+    )
+    
+    return {
+        "success": True,
+        "is_mine": False,
+        "game_over": False,
+        "tile_index": tile_index,
+        "revealed_count": num_revealed,
+        "current_multiplier": new_multiplier,
+        "next_multiplier": calculate_mines_multiplier(num_revealed + 1, num_mines),
+        "potential_payout": session['bet_amount'] * new_multiplier
+    }
+
+@api_router.post("/games/mines/cashout")
+async def cashout_mines(request_data: MinesCashoutRequest, request: Request):
+    """Cash out current mines game"""
+    user = await get_current_user(request)
+    user_id = str(user['id'])
+    
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    session = await db.game_sessions.find_one({"session_id": request_data.session_id, "user_id": user_id, "status": "in_progress"})
+    if not session:
+        raise HTTPException(status_code=400, detail="No active game session found")
+    
+    revealed = session['game_state']['revealed_tiles']
+    if len(revealed) == 0:
+        raise HTTPException(status_code=400, detail="Must reveal at least one tile")
+    
+    multiplier = session['multiplier']
+    payout = session['bet_amount'] * multiplier
+    profit = payout - session['bet_amount']
+    
+    db_user = await db.users.find_one({"id": user_id})
+    await db.users.update_one({"id": user_id}, {"$set": {"points_balance": db_user['points_balance'] + payout}})
+    
+    mine_positions = session['pre_calculated_result']
+    
+    await db.game_sessions.update_one(
+        {"session_id": request_data.session_id},
+        {"$set": {"status": "cashed_out", "payout": payout, "profit": profit, "completed_at": datetime.now(timezone.utc).isoformat()}}
+    )
+    
+    history_doc = {
+        "user_id": user_id,
+        "kick_username": session.get("kick_username", "Unknown"),
+        "game_type": "mines",
+        "bet_amount": session['bet_amount'],
+        "multiplier": multiplier,
+        "payout": payout,
+        "profit": profit,
+        "server_seed": session['server_seed'],
+        "server_seed_hashed": session['server_seed_hashed'],
+        "client_seed": session['client_seed'],
+        "nonce": session['nonce'],
+        "game_data": {"num_mines": session['game_state']['num_mines'], "mine_positions": mine_positions, "revealed_tiles": revealed, "cashed_out": True},
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.game_history.insert_one(history_doc)
+    
+    updated_user = await db.users.find_one({"id": user_id})
+    
+    return {
+        "success": True,
+        "multiplier": multiplier,
+        "payout": payout,
+        "profit": profit,
+        "new_balance": updated_user['points_balance'],
+        "mine_positions": mine_positions,
+        "server_seed": session['server_seed']
+    }
+
+# ============================================
+# BLACKJACK GAME ENDPOINTS
+# ============================================
+
+@api_router.post("/games/blackjack/start")
+async def start_blackjack(request_data: BlackjackStartRequest, request: Request):
+    """Start a new blackjack hand"""
+    user = await get_current_user(request)
+    user_id = str(user['id'])
+    
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    db_user = await db.users.find_one({"id": user_id})
+    if not db_user or db_user.get('points_balance', 0) < request_data.bet_amount:
+        raise HTTPException(status_code=400, detail="Insufficient balance")
+    
+    active_game = await db.game_sessions.find_one({"user_id": user_id, "game_type": "blackjack", "status": "in_progress"})
+    if active_game:
+        raise HTTPException(status_code=400, detail="You have an active blackjack hand")
+    
+    seeds = await db.user_seeds.find_one({"user_id": user_id})
+    if not seeds:
+        raise HTTPException(status_code=400, detail="Please initialize seeds first")
+    
+    deck = calculate_blackjack_deck(seeds['server_seed'], seeds['client_seed'], seeds['nonce'])
+    
+    player_hand = [deck[0], deck[2]]
+    dealer_hand = [deck[1], deck[3]]
+    deck_position = 4
+    
+    player_value = calculate_hand_value(player_hand)
+    dealer_value = calculate_hand_value(dealer_hand)
+    
+    player_blackjack = player_value == 21 and len(player_hand) == 2
+    dealer_blackjack = dealer_value == 21 and len(dealer_hand) == 2
+    
+    new_balance = db_user['points_balance'] - request_data.bet_amount
+    await db.users.update_one({"id": user_id}, {"$set": {"points_balance": new_balance}})
+    
+    session_id = str(uuid.uuid4())
+    session_doc = {
+        "session_id": session_id,
+        "user_id": user_id,
+        "kick_username": db_user.get("kick_username", "Unknown"),
+        "game_type": "blackjack",
+        "bet_amount": request_data.bet_amount,
+        "server_seed": seeds['server_seed'],
+        "server_seed_hashed": seeds['server_seed_hashed'],
+        "client_seed": seeds['client_seed'],
+        "nonce": seeds['nonce'],
+        "pre_calculated_result": deck,
+        "game_state": {"player_hand": player_hand, "dealer_hand": dealer_hand, "deck_position": deck_position, "player_value": player_value, "dealer_value": dealer_value, "doubled": False},
+        "status": "in_progress",
+        "multiplier": 0,
+        "payout": 0,
+        "profit": 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None
+    }
+    
+    if player_blackjack or dealer_blackjack:
+        if player_blackjack and dealer_blackjack:
+            payout = request_data.bet_amount
+            multiplier = 1.0
+            result = "push"
+        elif player_blackjack:
+            payout = request_data.bet_amount * 2.5
+            multiplier = 2.5
+            result = "blackjack"
+        else:
+            payout = 0
+            multiplier = 0
+            result = "dealer_blackjack"
+        
+        profit = payout - request_data.bet_amount
+        await db.users.update_one({"id": user_id}, {"$inc": {"points_balance": payout}})
+        
+        session_doc["status"] = "completed"
+        session_doc["multiplier"] = multiplier
+        session_doc["payout"] = payout
+        session_doc["profit"] = profit
+        session_doc["completed_at"] = datetime.now(timezone.utc).isoformat()
+        
+        await db.game_sessions.insert_one(session_doc)
+        await db.user_seeds.update_one({"user_id": user_id}, {"$inc": {"nonce": 1}})
+        
+        history_doc = {
+            "user_id": user_id,
+            "kick_username": db_user.get("kick_username", "Unknown"),
+            "game_type": "blackjack",
+            "bet_amount": request_data.bet_amount,
+            "multiplier": multiplier,
+            "payout": payout,
+            "profit": profit,
+            "server_seed": seeds['server_seed'],
+            "server_seed_hashed": seeds['server_seed_hashed'],
+            "client_seed": seeds['client_seed'],
+            "nonce": seeds['nonce'],
+            "game_data": {"result": result, "player_hand": player_hand, "dealer_hand": dealer_hand, "player_value": player_value, "dealer_value": dealer_value},
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        await db.game_history.insert_one(history_doc)
+        
+        updated_user = await db.users.find_one({"id": user_id})
+        
+        return {
+            "success": True,
+            "session_id": session_id,
+            "game_over": True,
+            "result": result,
+            "player_hand": player_hand,
+            "player_value": player_value,
+            "dealer_hand": dealer_hand,
+            "dealer_value": dealer_value,
+            "multiplier": multiplier,
+            "payout": payout,
+            "profit": profit,
+            "new_balance": updated_user['points_balance'],
+            "server_seed": seeds['server_seed']
+        }
+    
+    await db.game_sessions.insert_one(session_doc)
+    await db.user_seeds.update_one({"user_id": user_id}, {"$inc": {"nonce": 1}})
+    
+    return {
+        "success": True,
+        "session_id": session_id,
+        "game_over": False,
+        "player_hand": player_hand,
+        "player_value": player_value,
+        "dealer_hand": [dealer_hand[0]],
+        "dealer_visible_value": calculate_hand_value([dealer_hand[0]]),
+        "new_balance": new_balance,
+        "can_double": new_balance >= request_data.bet_amount,
+        "fairness": {
+            "server_seed_hashed": seeds['server_seed_hashed'],
+            "client_seed": seeds['client_seed'],
+            "nonce": seeds['nonce']
+        }
+    }
+
+@api_router.post("/games/blackjack/action")
+async def blackjack_action(request_data: BlackjackActionRequest, request: Request):
+    """Take action in blackjack (hit, stand, double)"""
+    user = await get_current_user(request)
+    user_id = str(user['id'])
+    
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    session = await db.game_sessions.find_one({"session_id": request_data.session_id, "user_id": user_id, "status": "in_progress"})
+    if not session:
+        raise HTTPException(status_code=400, detail="No active blackjack hand")
+    
+    deck = session['pre_calculated_result']
+    state = session['game_state']
+    player_hand = state['player_hand']
+    dealer_hand = state['dealer_hand']
+    deck_pos = state['deck_position']
+    bet_amount = session['bet_amount']
+    action = request_data.action.lower()
+    
+    db_user = await db.users.find_one({"id": user_id})
+    
+    if action == "hit":
+        player_hand.append(deck[deck_pos])
+        deck_pos += 1
+        player_value = calculate_hand_value(player_hand)
+        
+        if player_value > 21:
+            await db.game_sessions.update_one(
+                {"session_id": request_data.session_id},
+                {"$set": {"status": "completed", "game_state.player_hand": player_hand, "game_state.deck_position": deck_pos, "game_state.player_value": player_value, "multiplier": 0, "payout": 0, "profit": -bet_amount, "completed_at": datetime.now(timezone.utc).isoformat()}}
+            )
+            
+            history_doc = {
+                "user_id": user_id,
+                "kick_username": session.get("kick_username", "Unknown"),
+                "game_type": "blackjack",
+                "bet_amount": bet_amount,
+                "multiplier": 0,
+                "payout": 0,
+                "profit": -bet_amount,
+                "server_seed": session['server_seed'],
+                "server_seed_hashed": session['server_seed_hashed'],
+                "client_seed": session['client_seed'],
+                "nonce": session['nonce'],
+                "game_data": {"result": "bust", "player_hand": player_hand, "dealer_hand": dealer_hand, "player_value": player_value, "dealer_value": calculate_hand_value(dealer_hand)},
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }
+            await db.game_history.insert_one(history_doc)
+            
+            return {"success": True, "game_over": True, "result": "bust", "player_hand": player_hand, "player_value": player_value, "dealer_hand": dealer_hand, "dealer_value": calculate_hand_value(dealer_hand), "payout": 0, "profit": -bet_amount, "server_seed": session['server_seed']}
+        
+        await db.game_sessions.update_one({"session_id": request_data.session_id}, {"$set": {"game_state.player_hand": player_hand, "game_state.deck_position": deck_pos, "game_state.player_value": player_value}})
+        return {"success": True, "game_over": False, "player_hand": player_hand, "player_value": player_value, "can_double": False}
+    
+    elif action == "double":
+        if state['doubled'] or len(player_hand) > 2:
+            raise HTTPException(status_code=400, detail="Cannot double")
+        
+        if db_user['points_balance'] < bet_amount:
+            raise HTTPException(status_code=400, detail="Insufficient balance to double")
+        
+        await db.users.update_one({"id": user_id}, {"$inc": {"points_balance": -bet_amount}})
+        
+        player_hand.append(deck[deck_pos])
+        deck_pos += 1
+        player_value = calculate_hand_value(player_hand)
+        bet_amount *= 2
+        
+        await db.game_sessions.update_one({"session_id": request_data.session_id}, {"$set": {"game_state.player_hand": player_hand, "game_state.deck_position": deck_pos, "game_state.player_value": player_value, "game_state.doubled": True, "bet_amount": bet_amount}})
+        
+        if player_value > 21:
+            await db.game_sessions.update_one({"session_id": request_data.session_id}, {"$set": {"status": "completed", "multiplier": 0, "payout": 0, "profit": -bet_amount, "completed_at": datetime.now(timezone.utc).isoformat()}})
+            
+            history_doc = {
+                "user_id": user_id,
+                "kick_username": session.get("kick_username", "Unknown"),
+                "game_type": "blackjack",
+                "bet_amount": bet_amount,
+                "multiplier": 0,
+                "payout": 0,
+                "profit": -bet_amount,
+                "server_seed": session['server_seed'],
+                "server_seed_hashed": session['server_seed_hashed'],
+                "client_seed": session['client_seed'],
+                "nonce": session['nonce'],
+                "game_data": {"result": "bust", "player_hand": player_hand, "dealer_hand": dealer_hand, "player_value": player_value, "dealer_value": calculate_hand_value(dealer_hand), "doubled": True},
+                "created_at": datetime.now(timezone.utc).isoformat()
+            }
+            await db.game_history.insert_one(history_doc)
+            
+            return {"success": True, "game_over": True, "result": "bust", "player_hand": player_hand, "player_value": player_value, "dealer_hand": dealer_hand, "dealer_value": calculate_hand_value(dealer_hand), "payout": 0, "profit": -bet_amount, "server_seed": session['server_seed']}
+        
+        action = "stand"
+    
+    if action == "stand":
+        player_value = calculate_hand_value(player_hand)
+        dealer_value = calculate_hand_value(dealer_hand)
+        
+        while dealer_value < 17:
+            dealer_hand.append(deck[deck_pos])
+            deck_pos += 1
+            dealer_value = calculate_hand_value(dealer_hand)
+        
+        if dealer_value > 21:
+            result = "dealer_bust"
+            multiplier = 2.0
+        elif dealer_value > player_value:
+            result = "dealer_wins"
+            multiplier = 0
+        elif player_value > dealer_value:
+            result = "player_wins"
+            multiplier = 2.0
+        else:
+            result = "push"
+            multiplier = 1.0
+        
+        payout = bet_amount * multiplier
+        profit = payout - bet_amount
+        
+        if payout > 0:
+            await db.users.update_one({"id": user_id}, {"$inc": {"points_balance": payout}})
+        
+        await db.game_sessions.update_one(
+            {"session_id": request_data.session_id},
+            {"$set": {"status": "completed", "game_state.dealer_hand": dealer_hand, "game_state.dealer_value": dealer_value, "game_state.deck_position": deck_pos, "multiplier": multiplier, "payout": payout, "profit": profit, "completed_at": datetime.now(timezone.utc).isoformat()}}
+        )
+        
+        history_doc = {
+            "user_id": user_id,
+            "kick_username": session.get("kick_username", "Unknown"),
+            "game_type": "blackjack",
+            "bet_amount": bet_amount,
+            "multiplier": multiplier,
+            "payout": payout,
+            "profit": profit,
+            "server_seed": session['server_seed'],
+            "server_seed_hashed": session['server_seed_hashed'],
+            "client_seed": session['client_seed'],
+            "nonce": session['nonce'],
+            "game_data": {"result": result, "player_hand": player_hand, "dealer_hand": dealer_hand, "player_value": player_value, "dealer_value": dealer_value},
+            "created_at": datetime.now(timezone.utc).isoformat()
+        }
+        await db.game_history.insert_one(history_doc)
+        
+        updated_user = await db.users.find_one({"id": user_id})
+        
+        return {
+            "success": True,
+            "game_over": True,
+            "result": result,
+            "player_hand": player_hand,
+            "player_value": player_value,
+            "dealer_hand": dealer_hand,
+            "dealer_value": dealer_value,
+            "multiplier": multiplier,
+            "payout": payout,
+            "profit": profit,
+            "new_balance": updated_user['points_balance'],
+            "server_seed": session['server_seed']
+        }
+    
+    raise HTTPException(status_code=400, detail="Invalid action")
+
+# ============================================
+# GAME HISTORY & VERIFICATION ENDPOINTS
+# ============================================
+
+@api_router.get("/games/history")
+async def get_game_history(request: Request, game_type: Optional[str] = None, limit: int = 50):
+    """Get user's game history"""
+    user = await get_current_user(request)
+    user_id = str(user['id'])
+    
+    if db is None:
+        return {"success": True, "history": []}
+    
+    query = {"user_id": user_id}
+    if game_type:
+        query["game_type"] = game_type
+    
+    history = await db.game_history.find(query, {"_id": 0}).sort("created_at", -1).limit(limit).to_list(length=limit)
+    
+    return {"success": True, "history": history}
+
+@api_router.post("/games/verify")
+async def verify_game(request_data: VerifyGameRequest):
+    """Verify a game result was fair"""
+    result = verify_game_result(
+        request_data.server_seed,
+        request_data.server_seed_hashed,
+        request_data.client_seed,
+        request_data.nonce,
+        request_data.game_type.value,
+        request_data.game_params or {}
+    )
+    return {"success": True, "verification": result}
+
+@api_router.get("/games/active")
+async def get_active_games(request: Request):
+    """Get user's active game sessions"""
+    user = await get_current_user(request)
+    user_id = str(user['id'])
+    
+    if db is None:
+        return {"success": True, "active_games": []}
+    
+    active_sessions = await db.game_sessions.find({"user_id": user_id, "status": "in_progress"}, {"_id": 0, "pre_calculated_result": 0, "server_seed": 0}).to_list(length=10)
+    
+    return {"success": True, "active_games": active_sessions}
+
+# ============================================
+# ADMIN GAME ENDPOINTS
+# ============================================
+
+@api_router.get("/admin/game-history")
+async def admin_get_game_history(
+    page: int = Query(1, ge=1),
+    limit: int = Query(50, ge=1, le=100),
+    game_type: Optional[str] = None,
+    search: Optional[str] = None,
+    username: str = Depends(verify_admin)
+):
+    """Get global game history with pagination and filtering"""
+    if db is None:
+        return {"success": True, "history": [], "page": page, "limit": limit}
+    
+    skip = (page - 1) * limit
+    query = {}
+    
+    if game_type and game_type != 'all':
+        query['game_type'] = game_type
+    
+    if search:
+        query['kick_username'] = {"$regex": search, "$options": "i"}
+    
+    history = await db.game_history.find(query, {"_id": 0}).sort("created_at", -1).skip(skip).limit(limit).to_list(length=limit)
+    total = await db.game_history.count_documents(query)
+    
+    return {"success": True, "history": history, "page": page, "limit": limit, "total": total}
+
+@api_router.get("/admin/game-stats")
+async def admin_get_game_stats(username: str = Depends(verify_admin)):
+    """Get global game statistics"""
+    if db is None:
+        return {"success": True, "total_bets": 0, "total_wagered": 0, "total_payouts": 0, "by_game": {}, "top_players": [], "biggest_wins": []}
+    
+    overall_pipeline = [{"$group": {"_id": None, "total_bets": {"$sum": 1}, "total_wagered": {"$sum": "$bet_amount"}, "total_payouts": {"$sum": "$payout"}}}]
+    overall_result = await db.game_history.aggregate(overall_pipeline).to_list(length=1)
+    overall = overall_result[0] if overall_result else {"total_bets": 0, "total_wagered": 0, "total_payouts": 0}
+    
+    by_game_pipeline = [{"$group": {"_id": "$game_type", "bets": {"$sum": 1}, "wagered": {"$sum": "$bet_amount"}, "payouts": {"$sum": "$payout"}}}]
+    by_game_result = await db.game_history.aggregate(by_game_pipeline).to_list(length=10)
+    by_game = {g["_id"]: {"bets": g["bets"], "wagered": g["wagered"], "payouts": g["payouts"]} for g in by_game_result if g["_id"]}
+    
+    top_players_pipeline = [
+        {"$group": {"_id": "$user_id", "kick_username": {"$first": "$kick_username"}, "total_bets": {"$sum": 1}, "total_wagered": {"$sum": "$bet_amount"}, "total_won": {"$sum": "$payout"}, "wins": {"$sum": {"$cond": [{"$gt": ["$profit", 0]}, 1, 0]}}}},
+        {"$addFields": {"net_profit": {"$subtract": ["$total_won", "$total_wagered"]}, "win_rate": {"$multiply": [{"$divide": ["$wins", "$total_bets"]}, 100]}}},
+        {"$sort": {"net_profit": -1}},
+        {"$limit": 10}
+    ]
+    top_players = await db.game_history.aggregate(top_players_pipeline).to_list(length=10)
+    
+    biggest_wins = await db.game_history.find({"profit": {"$gt": 0}}, {"_id": 0}).sort("payout", -1).limit(10).to_list(length=10)
+    
+    return {
+        "success": True,
+        "total_bets": overall.get("total_bets", 0),
+        "total_wagered": overall.get("total_wagered", 0),
+        "total_payouts": overall.get("total_payouts", 0),
+        "house_profit": overall.get("total_wagered", 0) - overall.get("total_payouts", 0),
+        "by_game": by_game,
+        "top_players": top_players,
+        "biggest_wins": biggest_wins
+    }
+
+@api_router.get("/admin/users/{user_id}/game-stats")
+async def admin_get_user_game_stats(user_id: str, username: str = Depends(verify_admin)):
+    """Get game statistics for a specific user (P&L, breakdown, history)"""
+    if db is None:
+        return {"success": True, "total_bets": 0, "total_wagered": 0, "total_won": 0, "by_game": {}, "recent_games": []}
+    
+    overall_pipeline = [{"$match": {"user_id": user_id}}, {"$group": {"_id": None, "total_bets": {"$sum": 1}, "total_wagered": {"$sum": "$bet_amount"}, "total_won": {"$sum": "$payout"}}}]
+    overall_result = await db.game_history.aggregate(overall_pipeline).to_list(length=1)
+    overall = overall_result[0] if overall_result else {"total_bets": 0, "total_wagered": 0, "total_won": 0}
+    
+    by_game_pipeline = [{"$match": {"user_id": user_id}}, {"$group": {"_id": "$game_type", "bets": {"$sum": 1}, "wagered": {"$sum": "$bet_amount"}, "won": {"$sum": "$payout"}}}]
+    by_game_result = await db.game_history.aggregate(by_game_pipeline).to_list(length=10)
+    by_game = {g["_id"]: {"bets": g["bets"], "wagered": g["wagered"], "won": g["won"]} for g in by_game_result if g["_id"]}
+    
+    recent_games = await db.game_history.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).limit(50).to_list(length=50)
+    
+    return {
+        "success": True,
+        "total_bets": overall.get("total_bets", 0),
+        "total_wagered": overall.get("total_wagered", 0),
+        "total_won": overall.get("total_won", 0),
+        "net_profit": overall.get("total_won", 0) - overall.get("total_wagered", 0),
+        "by_game": by_game,
+        "recent_games": recent_games
+    }
+
 
 
 # ==================== BOTRIX LEGACY ENDPOINTS ====================
