@@ -943,6 +943,56 @@ async def logout(response: Response):
     return resp
 
 
+# ==================== FINGERPRINT ENDPOINTS ====================
+
+class FingerprintData(BaseModel):
+    hash: str
+    components: dict
+    collected_at: Optional[str] = None
+
+@api_router.post("/fingerprint")
+async def store_fingerprint(request: Request, fingerprint: FingerprintData):
+    """Store browser fingerprint for alt account detection"""
+    user = await get_current_user(request)
+    if db is None:
+        return {"success": False, "error": "Database not available"}
+    
+    try:
+        # Check if this fingerprint already exists for this user
+        existing = await db.users.find_one({
+            "id": user["id"],
+            "fingerprints.hash": fingerprint.hash
+        })
+        
+        if existing:
+            # Update last_seen for this fingerprint
+            await db.users.update_one(
+                {"id": user["id"], "fingerprints.hash": fingerprint.hash},
+                {"$set": {
+                    "fingerprints.$.last_seen": datetime.now(timezone.utc).isoformat()
+                },
+                "$inc": {"fingerprints.$.times_seen": 1}}
+            )
+        else:
+            # Add new fingerprint
+            fingerprint_doc = {
+                "hash": fingerprint.hash,
+                "components": fingerprint.components,
+                "first_seen": datetime.now(timezone.utc).isoformat(),
+                "last_seen": datetime.now(timezone.utc).isoformat(),
+                "times_seen": 1
+            }
+            await db.users.update_one(
+                {"id": user["id"]},
+                {"$push": {"fingerprints": fingerprint_doc}}
+            )
+        
+        return {"success": True}
+    except Exception as e:
+        logger.error(f"Error storing fingerprint: {e}")
+        return {"success": False, "error": str(e)}
+
+
 # ==================== USER ENDPOINTS ====================
 
 @api_router.get("/users/redemptions")
@@ -1555,6 +1605,228 @@ async def admin_get_alt_accounts(username: str = Depends(verify_admin)):
     except Exception as e:
         logger.error(f"Error getting alt accounts: {e}")
         return {"success": True, "alt_groups": []}
+
+
+@api_router.get("/admin/alt-accounts-v2")
+async def admin_get_alt_accounts_v2(username: str = Depends(verify_admin)):
+    """
+    Advanced alt account detection using browser fingerprints + IP.
+    Returns matches with confidence scores.
+    """
+    if db is None:
+        return {"success": True, "alt_groups": [], "stats": {}}
+    
+    try:
+        # Get all users with fingerprints
+        users = await db.users.find(
+            {"fingerprints": {"$exists": True, "$ne": []}},
+            {"_id": 0, "id": 1, "kick_username": 1, "points_balance": 1, 
+             "fingerprints": 1, "ip_addresses": 1, "registered_at": 1, "last_login": 1}
+        ).to_list(1000)
+        
+        # Build fingerprint to users mapping
+        fingerprint_map = {}  # hash -> [users]
+        ip_map = {}  # ip -> [users]
+        
+        for user in users:
+            # Map fingerprints
+            for fp in user.get("fingerprints", []):
+                fp_hash = fp.get("hash")
+                if fp_hash:
+                    if fp_hash not in fingerprint_map:
+                        fingerprint_map[fp_hash] = []
+                    fingerprint_map[fp_hash].append({
+                        "id": user["id"],
+                        "kick_username": user.get("kick_username"),
+                        "points_balance": user.get("points_balance", 0),
+                        "fingerprint_data": fp,
+                        "registered_at": user.get("registered_at"),
+                        "last_login": user.get("last_login")
+                    })
+            
+            # Map IPs
+            for ip in user.get("ip_addresses", []):
+                if ip:
+                    if ip not in ip_map:
+                        ip_map[ip] = []
+                    ip_map[ip].append(user["id"])
+        
+        # Find alt groups (same fingerprint = same device)
+        alt_groups = []
+        processed_pairs = set()
+        
+        for fp_hash, fp_users in fingerprint_map.items():
+            if len(fp_users) > 1:
+                # Found users with same fingerprint
+                user_ids = tuple(sorted([u["id"] for u in fp_users]))
+                if user_ids in processed_pairs:
+                    continue
+                processed_pairs.add(user_ids)
+                
+                # Calculate confidence score
+                confidence = 90  # Base: same fingerprint
+                
+                # Check if also same IP
+                user_ips = []
+                for u in fp_users:
+                    user_obj = next((usr for usr in users if usr["id"] == u["id"]), None)
+                    if user_obj:
+                        user_ips.extend(user_obj.get("ip_addresses", []))
+                
+                # Boost confidence if IPs overlap
+                ip_overlap = len(set(user_ips)) < len(user_ips)
+                if ip_overlap:
+                    confidence = 98
+                
+                total_points = sum(u.get("points_balance", 0) for u in fp_users)
+                
+                alt_groups.append({
+                    "fingerprint_hash": fp_hash,
+                    "confidence": confidence,
+                    "match_type": "fingerprint" + ("+ip" if ip_overlap else ""),
+                    "users": fp_users,
+                    "user_count": len(fp_users),
+                    "total_points": total_points,
+                    "ip_overlap": ip_overlap
+                })
+        
+        # Also check IP-only matches (lower confidence)
+        for ip, ip_user_ids in ip_map.items():
+            if len(ip_user_ids) > 1:
+                user_ids = tuple(sorted(ip_user_ids))
+                if user_ids in processed_pairs:
+                    continue
+                
+                # Check if these users DON'T have matching fingerprints (IP-only match)
+                ip_users = [u for u in users if u["id"] in ip_user_ids]
+                all_fps = []
+                for u in ip_users:
+                    all_fps.extend([fp.get("hash") for fp in u.get("fingerprints", [])])
+                
+                # If fingerprints are different, it's IP-only match
+                if len(set(all_fps)) == len(all_fps) or not all_fps:
+                    processed_pairs.add(user_ids)
+                    total_points = sum(u.get("points_balance", 0) for u in ip_users)
+                    
+                    alt_groups.append({
+                        "ip_address": ip[:10] + "..." if len(ip) > 10 else ip,  # Partial IP for privacy
+                        "confidence": 40,  # Lower confidence for IP-only
+                        "match_type": "ip_only",
+                        "users": [{
+                            "id": u["id"],
+                            "kick_username": u.get("kick_username"),
+                            "points_balance": u.get("points_balance", 0)
+                        } for u in ip_users],
+                        "user_count": len(ip_users),
+                        "total_points": total_points,
+                        "note": "Same IP but different devices - could be shared network"
+                    })
+        
+        # Sort by confidence (highest first)
+        alt_groups.sort(key=lambda x: x.get("confidence", 0), reverse=True)
+        
+        return {
+            "success": True,
+            "alt_groups": alt_groups,
+            "stats": {
+                "total_users_scanned": len(users),
+                "users_with_fingerprints": len([u for u in users if u.get("fingerprints")]),
+                "high_confidence_matches": len([g for g in alt_groups if g.get("confidence", 0) >= 90]),
+                "medium_confidence_matches": len([g for g in alt_groups if 50 <= g.get("confidence", 0) < 90]),
+                "low_confidence_matches": len([g for g in alt_groups if g.get("confidence", 0) < 50])
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error in alt detection v2: {e}")
+        return {"success": True, "alt_groups": [], "error": str(e)}
+
+
+@api_router.post("/admin/link-alt-accounts")
+async def admin_link_alt_accounts(data: dict, username: str = Depends(verify_admin)):
+    """Mark accounts as known alts (allowed/family)"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    user_ids = data.get("user_ids", [])
+    link_type = data.get("link_type", "allowed")  # allowed, family, same_person
+    
+    if len(user_ids) < 2:
+        raise HTTPException(status_code=400, detail="Need at least 2 user IDs")
+    
+    link_id = str(uuid.uuid4())
+    
+    # Update all users with the link
+    await db.users.update_many(
+        {"id": {"$in": user_ids}},
+        {"$set": {"alt_link": {"link_id": link_id, "link_type": link_type, "linked_at": datetime.now(timezone.utc).isoformat()}}}
+    )
+    
+    return {"success": True, "link_id": link_id, "users_linked": len(user_ids)}
+
+
+@api_router.post("/admin/merge-alt-accounts")
+async def admin_merge_alt_accounts(data: dict, username: str = Depends(verify_admin)):
+    """Merge alt accounts into primary (combine points, delete alts)"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    primary_id = data.get("primary_id")
+    alt_ids = data.get("alt_ids", [])
+    
+    if not primary_id or not alt_ids:
+        raise HTTPException(status_code=400, detail="Need primary_id and alt_ids")
+    
+    # Get all accounts
+    all_ids = [primary_id] + alt_ids
+    users = await db.users.find({"id": {"$in": all_ids}}).to_list(100)
+    
+    if len(users) != len(all_ids):
+        raise HTTPException(status_code=400, detail="Some users not found")
+    
+    # Calculate totals
+    total_points = sum(u.get("points_balance", 0) for u in users)
+    total_earned = sum(u.get("total_earned", 0) for u in users)
+    
+    # Merge fingerprints and IPs from alts into primary
+    all_fingerprints = []
+    all_ips = []
+    for u in users:
+        all_fingerprints.extend(u.get("fingerprints", []))
+        all_ips.extend(u.get("ip_addresses", []))
+    
+    # Deduplicate
+    unique_ips = list(set(all_ips))
+    seen_hashes = set()
+    unique_fps = []
+    for fp in all_fingerprints:
+        if fp.get("hash") not in seen_hashes:
+            seen_hashes.add(fp.get("hash"))
+            unique_fps.append(fp)
+    
+    # Update primary
+    await db.users.update_one(
+        {"id": primary_id},
+        {"$set": {
+            "points_balance": total_points,
+            "total_earned": total_earned,
+            "fingerprints": unique_fps,
+            "ip_addresses": unique_ips,
+            "merged_alts": alt_ids,
+            "merged_at": datetime.now(timezone.utc).isoformat()
+        }}
+    )
+    
+    # Delete alts
+    delete_result = await db.users.delete_many({"id": {"$in": alt_ids}})
+    
+    return {
+        "success": True,
+        "primary_id": primary_id,
+        "alts_merged": len(alt_ids),
+        "alts_deleted": delete_result.deleted_count,
+        "new_points_balance": total_points,
+        "new_total_earned": total_earned
+    }
 
 
 # ==================== DATABASE DIAGNOSTICS ====================
