@@ -329,6 +329,7 @@ class AdminUserUpdate(BaseModel):
     points_balance: Optional[int] = None
     is_banned: Optional[bool] = None
     can_redeem: Optional[bool] = None
+    can_play_games: Optional[bool] = None
 
 class EarningRatesUpdate(BaseModel):
     chat_message_points: Optional[int] = None
@@ -346,6 +347,37 @@ class LeaderboardTimerUpdate(BaseModel):
 class PointsAdjustment(BaseModel):
     amount: int
     reason: Optional[str] = None
+
+
+# ==================== AUDIT LOG HELPER ====================
+
+async def create_audit_log(
+    action: str,
+    admin_username: str,
+    target_type: str,  # "user", "game", "shop_item", "challenge", "redemption", "settings", "system"
+    target_id: Optional[str] = None,
+    target_name: Optional[str] = None,
+    details: Optional[dict] = None,
+    ip_address: Optional[str] = None
+):
+    """Create an audit log entry for admin actions"""
+    if db is None:
+        return None
+    
+    log_entry = {
+        "id": str(uuid.uuid4()),
+        "action": action,
+        "admin_username": admin_username,
+        "target_type": target_type,
+        "target_id": target_id,
+        "target_name": target_name,
+        "details": details or {},
+        "ip_address": ip_address,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+    
+    await db.audit_logs.insert_one(log_entry)
+    return log_entry
 
 
 # JWT Helper Functions
@@ -1084,12 +1116,29 @@ async def get_points_balance(request: Request):
 # ==================== ADMIN ENDPOINTS ====================
 
 @api_router.post("/admin/login")
-async def admin_login(credentials: dict):
+async def admin_login(credentials: dict, request: Request):
     username = credentials.get("username", "")
     password = credentials.get("password", "")
     
+    client_ip = request.client.host if request.client else "unknown"
+    
     if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+        await create_audit_log(
+            action="admin_login",
+            admin_username=username,
+            target_type="system",
+            details={"status": "success"},
+            ip_address=client_ip
+        )
         return {"success": True, "message": "Login successful"}
+    
+    await create_audit_log(
+        action="admin_login_failed",
+        admin_username=username or "unknown",
+        target_type="system",
+        details={"status": "failed", "attempted_username": username},
+        ip_address=client_ip
+    )
     raise HTTPException(status_code=401, detail="Invalid credentials")
 
 @api_router.get("/admin/settings")
@@ -1100,7 +1149,7 @@ async def admin_get_all_settings(username: str = Depends(verify_admin)):
     return {"success": True, "settings": all_settings}
 
 @api_router.put("/admin/settings/{site}")
-async def admin_update_settings(site: str, settings: LeaderboardSettingsUpdate, username: str = Depends(verify_admin)):
+async def admin_update_settings(site: str, settings: LeaderboardSettingsUpdate, request: Request, username: str = Depends(verify_admin)):
     site = site.lower()
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available")
@@ -1112,7 +1161,135 @@ async def admin_update_settings(site: str, settings: LeaderboardSettingsUpdate, 
         existing["site"] = site
         await db.leaderboard_settings.update_one({"site": site}, {"$set": existing}, upsert=True)
     
+    client_ip = request.client.host if request.client else "unknown"
+    await create_audit_log(
+        action="update_leaderboard_settings",
+        admin_username=username,
+        target_type="settings",
+        target_id=site,
+        target_name=f"{site} leaderboard",
+        details={"updated_fields": list(update_data.keys()), "new_values": update_data},
+        ip_address=client_ip
+    )
+    
     return {"success": True, "message": f"Settings for {site} updated", "settings": existing}
+
+
+# ==================== ADMIN AUDIT LOGS ====================
+
+@api_router.get("/admin/audit-logs")
+async def admin_get_audit_logs(
+    action: Optional[str] = None,
+    admin_username: Optional[str] = None,
+    target_type: Optional[str] = None,
+    target_id: Optional[str] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    limit: int = 100,
+    offset: int = 0,
+    username: str = Depends(verify_admin)
+):
+    """Get audit logs with filters"""
+    if db is None:
+        return {"success": True, "logs": [], "total": 0}
+    
+    query = {}
+    
+    if action:
+        query["action"] = {"$regex": action, "$options": "i"}
+    if admin_username:
+        query["admin_username"] = {"$regex": admin_username, "$options": "i"}
+    if target_type:
+        query["target_type"] = target_type
+    if target_id:
+        query["target_id"] = target_id
+    if start_date:
+        query["timestamp"] = {"$gte": start_date}
+    if end_date:
+        if "timestamp" in query:
+            query["timestamp"]["$lte"] = end_date
+        else:
+            query["timestamp"] = {"$lte": end_date}
+    
+    total = await db.audit_logs.count_documents(query)
+    logs = await db.audit_logs.find(query, {"_id": 0}).sort("timestamp", -1).skip(offset).limit(limit).to_list(length=limit)
+    
+    return {
+        "success": True,
+        "logs": logs,
+        "total": total,
+        "limit": limit,
+        "offset": offset
+    }
+
+@api_router.get("/admin/audit-logs/actions")
+async def admin_get_audit_log_actions(username: str = Depends(verify_admin)):
+    """Get list of all unique actions in audit logs"""
+    if db is None:
+        return {"success": True, "actions": []}
+    
+    actions = await db.audit_logs.distinct("action")
+    return {"success": True, "actions": sorted(actions)}
+
+@api_router.get("/admin/audit-logs/stats")
+async def admin_get_audit_log_stats(username: str = Depends(verify_admin)):
+    """Get audit log statistics"""
+    if db is None:
+        return {"success": True, "stats": {}}
+    
+    # Total logs
+    total = await db.audit_logs.count_documents({})
+    
+    # Logs by action type
+    by_action_pipeline = [
+        {"$group": {"_id": "$action", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 20}
+    ]
+    by_action = await db.audit_logs.aggregate(by_action_pipeline).to_list(length=20)
+    
+    # Logs by admin
+    by_admin_pipeline = [
+        {"$group": {"_id": "$admin_username", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 10}
+    ]
+    by_admin = await db.audit_logs.aggregate(by_admin_pipeline).to_list(length=10)
+    
+    # Logs by target type
+    by_target_pipeline = [
+        {"$group": {"_id": "$target_type", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}}
+    ]
+    by_target = await db.audit_logs.aggregate(by_target_pipeline).to_list(length=10)
+    
+    # Recent activity (last 24 hours)
+    yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+    recent_count = await db.audit_logs.count_documents({"timestamp": {"$gte": yesterday}})
+    
+    return {
+        "success": True,
+        "stats": {
+            "total_logs": total,
+            "last_24h": recent_count,
+            "by_action": {item["_id"]: item["count"] for item in by_action},
+            "by_admin": {item["_id"]: item["count"] for item in by_admin},
+            "by_target_type": {item["_id"]: item["count"] for item in by_target}
+        }
+    }
+
+@api_router.get("/admin/audit-logs/user/{user_id}")
+async def admin_get_user_audit_logs(user_id: str, limit: int = 50, username: str = Depends(verify_admin)):
+    """Get all audit logs related to a specific user"""
+    if db is None:
+        return {"success": True, "logs": []}
+    
+    logs = await db.audit_logs.find(
+        {"target_id": user_id, "target_type": "user"},
+        {"_id": 0}
+    ).sort("timestamp", -1).limit(limit).to_list(length=limit)
+    
+    return {"success": True, "logs": logs}
 
 
 # ==================== ADMIN CHALLENGES ====================
@@ -1125,7 +1302,7 @@ async def admin_get_challenges(username: str = Depends(verify_admin)):
     return {"success": True, "challenges": challenges}
 
 @api_router.post("/admin/challenges")
-async def admin_create_challenge(challenge: ChallengeCreate, username: str = Depends(verify_admin)):
+async def admin_create_challenge(challenge: ChallengeCreate, request: Request, username: str = Depends(verify_admin)):
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available")
     
@@ -1136,10 +1313,21 @@ async def admin_create_challenge(challenge: ChallengeCreate, username: str = Dep
     await db.challenges.insert_one(challenge_dict)
     challenge_dict.pop("_id", None)
     
+    client_ip = request.client.host if request.client else "unknown"
+    await create_audit_log(
+        action="create_challenge",
+        admin_username=username,
+        target_type="challenge",
+        target_id=challenge_dict["id"],
+        target_name=challenge_dict.get("game_name"),
+        details={"site": challenge_dict.get("site"), "reward": challenge_dict.get("reward")},
+        ip_address=client_ip
+    )
+    
     return {"success": True, "message": "Challenge created", "challenge": challenge_dict}
 
 @api_router.put("/admin/challenges/{challenge_id}")
-async def admin_update_challenge(challenge_id: str, challenge: ChallengeUpdate, username: str = Depends(verify_admin)):
+async def admin_update_challenge(challenge_id: str, challenge: ChallengeUpdate, request: Request, username: str = Depends(verify_admin)):
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available")
     
@@ -1147,21 +1335,50 @@ async def admin_update_challenge(challenge_id: str, challenge: ChallengeUpdate, 
     if not update_data:
         raise HTTPException(status_code=400, detail="No data to update")
     
+    # Get existing challenge for audit log
+    existing = await db.challenges.find_one({"id": challenge_id}, {"_id": 0})
+    
     result = await db.challenges.update_one({"id": challenge_id}, {"$set": update_data})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Challenge not found")
     
     updated = await db.challenges.find_one({"id": challenge_id}, {"_id": 0})
+    
+    client_ip = request.client.host if request.client else "unknown"
+    await create_audit_log(
+        action="update_challenge",
+        admin_username=username,
+        target_type="challenge",
+        target_id=challenge_id,
+        target_name=updated.get("game_name") if updated else None,
+        details={"updated_fields": list(update_data.keys()), "changes": update_data},
+        ip_address=client_ip
+    )
+    
     return {"success": True, "message": "Challenge updated", "challenge": updated}
 
 @api_router.delete("/admin/challenges/{challenge_id}")
-async def admin_delete_challenge(challenge_id: str, username: str = Depends(verify_admin)):
+async def admin_delete_challenge(challenge_id: str, request: Request, username: str = Depends(verify_admin)):
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Get challenge info before deleting
+    challenge = await db.challenges.find_one({"id": challenge_id}, {"_id": 0})
     
     result = await db.challenges.delete_one({"id": challenge_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Challenge not found")
+    
+    client_ip = request.client.host if request.client else "unknown"
+    await create_audit_log(
+        action="delete_challenge",
+        admin_username=username,
+        target_type="challenge",
+        target_id=challenge_id,
+        target_name=challenge.get("game_name") if challenge else None,
+        details={"deleted_challenge": challenge},
+        ip_address=client_ip
+    )
     
     return {"success": True, "message": "Challenge deleted"}
 
@@ -1176,7 +1393,7 @@ async def admin_get_shop_items(username: str = Depends(verify_admin)):
     return {"success": True, "items": items}
 
 @api_router.post("/admin/shop/items")
-async def admin_create_shop_item(item: ShopItemCreate, username: str = Depends(verify_admin)):
+async def admin_create_shop_item(item: ShopItemCreate, request: Request, username: str = Depends(verify_admin)):
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available")
     
@@ -1187,10 +1404,22 @@ async def admin_create_shop_item(item: ShopItemCreate, username: str = Depends(v
     
     await db.shop_items.insert_one(item_dict)
     item_dict.pop("_id", None)
+    
+    client_ip = request.client.host if request.client else "unknown"
+    await create_audit_log(
+        action="create_shop_item",
+        admin_username=username,
+        target_type="shop_item",
+        target_id=item_dict["id"],
+        target_name=item_dict.get("name"),
+        details={"price_points": item_dict.get("price_points"), "category": item_dict.get("category")},
+        ip_address=client_ip
+    )
+    
     return {"success": True, "item": item_dict}
 
 @api_router.put("/admin/shop/items/{item_id}")
-async def admin_update_shop_item(item_id: str, update: ShopItemUpdate, username: str = Depends(verify_admin)):
+async def admin_update_shop_item(item_id: str, update: ShopItemUpdate, request: Request, username: str = Depends(verify_admin)):
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available")
     
@@ -1203,16 +1432,42 @@ async def admin_update_shop_item(item_id: str, update: ShopItemUpdate, username:
         raise HTTPException(status_code=404, detail="Item not found")
     
     updated = await db.shop_items.find_one({"id": item_id}, {"_id": 0})
+    
+    client_ip = request.client.host if request.client else "unknown"
+    await create_audit_log(
+        action="update_shop_item",
+        admin_username=username,
+        target_type="shop_item",
+        target_id=item_id,
+        target_name=updated.get("name") if updated else None,
+        details={"updated_fields": list(update_data.keys()), "changes": update_data},
+        ip_address=client_ip
+    )
+    
     return {"success": True, "item": updated}
 
 @api_router.delete("/admin/shop/items/{item_id}")
-async def admin_delete_shop_item(item_id: str, username: str = Depends(verify_admin)):
+async def admin_delete_shop_item(item_id: str, request: Request, username: str = Depends(verify_admin)):
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Get item info before deleting
+    item = await db.shop_items.find_one({"id": item_id}, {"_id": 0})
     
     result = await db.shop_items.delete_one({"id": item_id})
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Item not found")
+    
+    client_ip = request.client.host if request.client else "unknown"
+    await create_audit_log(
+        action="delete_shop_item",
+        admin_username=username,
+        target_type="shop_item",
+        target_id=item_id,
+        target_name=item.get("name") if item else None,
+        details={"deleted_item": item},
+        ip_address=client_ip
+    )
     
     return {"success": True, "message": "Item deleted"}
 
@@ -1234,7 +1489,7 @@ async def admin_get_redemptions(status: Optional[str] = None, username: str = De
     return {"success": True, "redemptions": redemptions, "counts": {"pending": pending, "approved": approved, "rejected": rejected}}
 
 @api_router.put("/admin/redemptions/{redemption_id}")
-async def admin_update_redemption(redemption_id: str, update: RedemptionStatusUpdate, username: str = Depends(verify_admin)):
+async def admin_update_redemption(redemption_id: str, update: RedemptionStatusUpdate, request: Request, username: str = Depends(verify_admin)):
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available")
     
@@ -1251,9 +1506,28 @@ async def admin_update_redemption(redemption_id: str, update: RedemptionStatusUp
             new_balance = user["points_balance"] + redemption["points_spent"]
             await db.users.update_one({"id": user["id"]}, {"$set": {"points_balance": new_balance}})
     
-    await db.redemptions.update_one({"id": redemption_id}, {"$set": {"status": update.status, "admin_notes": update.admin_notes, "handled_at": datetime.now(timezone.utc).isoformat()}})
+    await db.redemptions.update_one({"id": redemption_id}, {"$set": {"status": update.status, "admin_notes": update.admin_notes, "handled_at": datetime.now(timezone.utc).isoformat(), "handled_by": username}})
     
     updated = await db.redemptions.find_one({"id": redemption_id}, {"_id": 0})
+    
+    client_ip = request.client.host if request.client else "unknown"
+    await create_audit_log(
+        action=f"redemption_{update.status}",
+        admin_username=username,
+        target_type="redemption",
+        target_id=redemption_id,
+        target_name=redemption.get("item_name"),
+        details={
+            "user_id": redemption.get("user_id"),
+            "kick_username": redemption.get("kick_username"),
+            "item_name": redemption.get("item_name"),
+            "points_spent": redemption.get("points_spent"),
+            "admin_notes": update.admin_notes,
+            "new_status": update.status
+        },
+        ip_address=client_ip
+    )
+    
     return {"success": True, "redemption": updated}
 
 
@@ -1272,9 +1546,12 @@ async def admin_get_users(search: Optional[str] = None, username: str = Depends(
     return {"success": True, "users": users}
 
 @api_router.put("/admin/users/{user_id}")
-async def admin_update_user(user_id: str, update: AdminUserUpdate, username: str = Depends(verify_admin)):
+async def admin_update_user(user_id: str, update: AdminUserUpdate, request: Request, username: str = Depends(verify_admin)):
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Get user before update
+    user_before = await db.users.find_one({"id": user_id}, {"_id": 0, "kick_username": 1})
     
     update_data = update.model_dump(exclude_none=True)
     if not update_data:
@@ -1285,34 +1562,72 @@ async def admin_update_user(user_id: str, update: AdminUserUpdate, username: str
         raise HTTPException(status_code=404, detail="User not found")
     
     updated = await db.users.find_one({"id": user_id}, {"_id": 0, "access_token": 0, "refresh_token": 0})
+    
+    client_ip = request.client.host if request.client else "unknown"
+    await create_audit_log(
+        action="update_user",
+        admin_username=username,
+        target_type="user",
+        target_id=user_id,
+        target_name=user_before.get("kick_username") if user_before else None,
+        details={"updated_fields": list(update_data.keys()), "changes": update_data},
+        ip_address=client_ip
+    )
+    
     return {"success": True, "user": updated}
 
 @api_router.post("/admin/users/{user_id}/ban")
-async def admin_ban_user(user_id: str, username: str = Depends(verify_admin)):
+async def admin_ban_user(user_id: str, request: Request, username: str = Depends(verify_admin)):
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available")
     
-    result = await db.users.update_one({"id": user_id}, {"$set": {"is_banned": True, "banned_at": datetime.now(timezone.utc).isoformat()}})
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "kick_username": 1})
+    
+    result = await db.users.update_one({"id": user_id}, {"$set": {"is_banned": True, "banned_at": datetime.now(timezone.utc).isoformat(), "banned_by": username}})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
+    
+    client_ip = request.client.host if request.client else "unknown"
+    await create_audit_log(
+        action="ban_user",
+        admin_username=username,
+        target_type="user",
+        target_id=user_id,
+        target_name=user.get("kick_username") if user else None,
+        details={"action": "full_ban"},
+        ip_address=client_ip
+    )
     
     updated = await db.users.find_one({"id": user_id}, {"_id": 0, "access_token": 0, "refresh_token": 0})
     return {"success": True, "message": "User banned", "user": updated}
 
 @api_router.post("/admin/users/{user_id}/unban")
-async def admin_unban_user(user_id: str, username: str = Depends(verify_admin)):
+async def admin_unban_user(user_id: str, request: Request, username: str = Depends(verify_admin)):
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available")
     
-    result = await db.users.update_one({"id": user_id}, {"$set": {"is_banned": False}})
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "kick_username": 1})
+    
+    result = await db.users.update_one({"id": user_id}, {"$set": {"is_banned": False}, "$unset": {"banned_at": "", "banned_by": ""}})
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="User not found")
+    
+    client_ip = request.client.host if request.client else "unknown"
+    await create_audit_log(
+        action="unban_user",
+        admin_username=username,
+        target_type="user",
+        target_id=user_id,
+        target_name=user.get("kick_username") if user else None,
+        details={"action": "unban"},
+        ip_address=client_ip
+    )
     
     updated = await db.users.find_one({"id": user_id}, {"_id": 0, "access_token": 0, "refresh_token": 0})
     return {"success": True, "message": "User unbanned", "user": updated}
 
 @api_router.post("/admin/users/{user_id}/adjust-points")
-async def admin_adjust_points(user_id: str, adjustment: PointsAdjustment, username: str = Depends(verify_admin)):
+async def admin_adjust_points(user_id: str, adjustment: PointsAdjustment, request: Request, username: str = Depends(verify_admin)):
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available")
     
@@ -1339,6 +1654,22 @@ async def admin_adjust_points(user_id: str, adjustment: PointsAdjustment, userna
         "timestamp": datetime.now(timezone.utc).isoformat()
     }
     await db.point_adjustments.insert_one(adjustment_log)
+    
+    client_ip = request.client.host if request.client else "unknown"
+    await create_audit_log(
+        action="adjust_points",
+        admin_username=username,
+        target_type="user",
+        target_id=user_id,
+        target_name=user.get("kick_username"),
+        details={
+            "amount": adjustment.amount,
+            "reason": adjustment.reason or "Manual adjustment",
+            "previous_balance": current_balance,
+            "new_balance": new_balance
+        },
+        ip_address=client_ip
+    )
     
     updated = await db.users.find_one({"id": user_id}, {"_id": 0, "access_token": 0, "refresh_token": 0})
     return {"success": True, "message": f"Points adjusted by {adjustment.amount:+d}", "user": updated}
@@ -2947,9 +3278,13 @@ async def play_dice(request_data: DiceBetRequest, request: Request):
     if db is None:
         raise HTTPException(status_code=503, detail="Database not available")
     
-    # Check balance
+    # Check balance and game ban status
     db_user = await db.users.find_one({"id": user_id})
-    if not db_user or db_user.get('points_balance', 0) < request_data.bet_amount:
+    if not db_user:
+        raise HTTPException(status_code=400, detail="User not found")
+    if db_user.get('can_play_games') == False:
+        raise HTTPException(status_code=403, detail="You are banned from playing games")
+    if db_user.get('points_balance', 0) < request_data.bet_amount:
         raise HTTPException(status_code=400, detail="Insufficient balance")
     
     # Get user seeds
@@ -3042,7 +3377,11 @@ async def play_wheel(request_data: WheelBetRequest, request: Request):
         raise HTTPException(status_code=400, detail="Invalid segment count")
     
     db_user = await db.users.find_one({"id": user_id})
-    if not db_user or db_user.get('points_balance', 0) < request_data.bet_amount:
+    if not db_user:
+        raise HTTPException(status_code=400, detail="User not found")
+    if db_user.get('can_play_games') == False:
+        raise HTTPException(status_code=403, detail="You are banned from playing games")
+    if db_user.get('points_balance', 0) < request_data.bet_amount:
         raise HTTPException(status_code=400, detail="Insufficient balance")
     
     seeds = await db.user_seeds.find_one({"user_id": user_id})
@@ -3128,7 +3467,11 @@ async def play_limbo(request_data: LimboBetRequest, request: Request):
         raise HTTPException(status_code=503, detail="Database not available")
     
     db_user = await db.users.find_one({"id": user_id})
-    if not db_user or db_user.get('points_balance', 0) < request_data.bet_amount:
+    if not db_user:
+        raise HTTPException(status_code=400, detail="User not found")
+    if db_user.get('can_play_games') == False:
+        raise HTTPException(status_code=403, detail="You are banned from playing games")
+    if db_user.get('points_balance', 0) < request_data.bet_amount:
         raise HTTPException(status_code=400, detail="Insufficient balance")
     
     seeds = await db.user_seeds.find_one({"user_id": user_id})
@@ -3197,7 +3540,11 @@ async def start_mines(request_data: MinesStartRequest, request: Request):
         raise HTTPException(status_code=503, detail="Database not available")
     
     db_user = await db.users.find_one({"id": user_id})
-    if not db_user or db_user.get('points_balance', 0) < request_data.bet_amount:
+    if not db_user:
+        raise HTTPException(status_code=400, detail="User not found")
+    if db_user.get('can_play_games') == False:
+        raise HTTPException(status_code=403, detail="You are banned from playing games")
+    if db_user.get('points_balance', 0) < request_data.bet_amount:
         raise HTTPException(status_code=400, detail="Insufficient balance")
     
     # Check no active mines game
@@ -3448,7 +3795,11 @@ async def start_blackjack(request_data: BlackjackStartRequest, request: Request)
         raise HTTPException(status_code=503, detail="Database not available")
     
     db_user = await db.users.find_one({"id": user_id})
-    if not db_user or db_user.get('points_balance', 0) < request_data.bet_amount:
+    if not db_user:
+        raise HTTPException(status_code=400, detail="User not found")
+    if db_user.get('can_play_games') == False:
+        raise HTTPException(status_code=403, detail="You are banned from playing games")
+    if db_user.get('points_balance', 0) < request_data.bet_amount:
         raise HTTPException(status_code=400, detail="Insufficient balance")
     
     active_game = await db.game_sessions.find_one({"user_id": user_id, "game_type": "blackjack", "status": "in_progress"})
@@ -4088,6 +4439,606 @@ async def botrix_leaderboard():
 @api_router.get("/bot/commands")
 async def botrix_commands():
     return Response(content="Commands: !points | !leaderboard | !tip @user amount", media_type="text/plain")
+
+
+# ==================== PUBLIC USER PROFILE ENDPOINTS ====================
+
+@api_router.get("/users/search")
+async def search_users(q: str = Query(..., min_length=1), limit: int = 20):
+    """Search users by username"""
+    if db is None:
+        return {"success": True, "users": []}
+    
+    query = {"kick_username": {"$regex": q, "$options": "i"}}
+    users = await db.users.find(
+        query, 
+        {"_id": 0, "id": 1, "kick_username": 1, "avatar": 1, "points_balance": 1, "registered_at": 1}
+    ).limit(limit).to_list(length=limit)
+    
+    return {"success": True, "users": users, "count": len(users)}
+
+@api_router.get("/users/{username}/profile")
+async def get_user_profile(username: str):
+    """Get public user profile by username"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    user = await db.users.find_one(
+        {"kick_username": {"$regex": f"^{username}$", "$options": "i"}},
+        {"_id": 0, "access_token": 0, "refresh_token": 0, "ip_addresses": 0, "fingerprints": 0}
+    )
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Get game stats
+    user_id = user.get("id")
+    stats_pipeline = [
+        {"$match": {"user_id": user_id}},
+        {"$group": {
+            "_id": None,
+            "total_bets": {"$sum": 1},
+            "total_wagered": {"$sum": "$bet_amount"},
+            "total_won": {"$sum": "$payout"}
+        }}
+    ]
+    stats_result = await db.game_history.aggregate(stats_pipeline).to_list(length=1)
+    stats = stats_result[0] if stats_result else {"total_bets": 0, "total_wagered": 0, "total_won": 0}
+    
+    profile = {
+        "id": user.get("id"),
+        "kick_username": user.get("kick_username"),
+        "avatar": user.get("avatar"),
+        "points_balance": user.get("points_balance", 0),
+        "total_earned": user.get("total_earned", 0),
+        "total_spent": user.get("total_spent", 0),
+        "registered_at": user.get("registered_at"),
+        "game_stats": {
+            "total_bets": stats.get("total_bets", 0),
+            "total_wagered": round(stats.get("total_wagered", 0), 2),
+            "total_won": round(stats.get("total_won", 0), 2),
+            "net_profit": round(stats.get("total_won", 0) - stats.get("total_wagered", 0), 2)
+        }
+    }
+    
+    return {"success": True, "profile": profile}
+
+@api_router.get("/users/{username}/stats")
+async def get_user_stats(username: str):
+    """Get user's game statistics breakdown"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    user = await db.users.find_one(
+        {"kick_username": {"$regex": f"^{username}$", "$options": "i"}},
+        {"_id": 0, "id": 1}
+    )
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user_id = user.get("id")
+    
+    # Overall stats
+    overall_pipeline = [
+        {"$match": {"user_id": user_id}},
+        {"$group": {
+            "_id": None,
+            "total_bets": {"$sum": 1},
+            "total_wagered": {"$sum": "$bet_amount"},
+            "total_won": {"$sum": "$payout"},
+            "wins": {"$sum": {"$cond": [{"$gt": ["$payout", "$bet_amount"]}, 1, 0]}},
+            "losses": {"$sum": {"$cond": [{"$lte": ["$payout", "$bet_amount"]}, 1, 0]}}
+        }}
+    ]
+    overall_result = await db.game_history.aggregate(overall_pipeline).to_list(length=1)
+    overall = overall_result[0] if overall_result else {"total_bets": 0, "total_wagered": 0, "total_won": 0, "wins": 0, "losses": 0}
+    
+    # Stats by game type
+    by_game_pipeline = [
+        {"$match": {"user_id": user_id}},
+        {"$group": {
+            "_id": "$game_type",
+            "bets": {"$sum": 1},
+            "wagered": {"$sum": "$bet_amount"},
+            "won": {"$sum": "$payout"},
+            "wins": {"$sum": {"$cond": [{"$gt": ["$payout", "$bet_amount"]}, 1, 0]}},
+            "losses": {"$sum": {"$cond": [{"$lte": ["$payout", "$bet_amount"]}, 1, 0]}}
+        }}
+    ]
+    by_game_result = await db.game_history.aggregate(by_game_pipeline).to_list(length=10)
+    by_game = {}
+    for g in by_game_result:
+        if g["_id"]:
+            by_game[g["_id"]] = {
+                "bets": g["bets"],
+                "wagered": round(g["wagered"], 2),
+                "won": round(g["won"], 2),
+                "profit": round(g["won"] - g["wagered"], 2),
+                "wins": g["wins"],
+                "losses": g["losses"]
+            }
+    
+    return {
+        "success": True,
+        "stats": {
+            "total_bets": overall.get("total_bets", 0),
+            "total_wagered": round(overall.get("total_wagered", 0), 2),
+            "total_won": round(overall.get("total_won", 0), 2),
+            "net_profit": round(overall.get("total_won", 0) - overall.get("total_wagered", 0), 2),
+            "wins": overall.get("wins", 0),
+            "losses": overall.get("losses", 0),
+            "win_rate": round((overall.get("wins", 0) / overall.get("total_bets", 1)) * 100, 2) if overall.get("total_bets", 0) > 0 else 0,
+            "by_game": by_game
+        }
+    }
+
+@api_router.get("/users/{username}/games/history")
+async def get_user_game_history(username: str, game_type: Optional[str] = None, limit: int = 50, offset: int = 0):
+    """Get user's game history (public view)"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    user = await db.users.find_one(
+        {"kick_username": {"$regex": f"^{username}$", "$options": "i"}},
+        {"_id": 0, "id": 1}
+    )
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user_id = user.get("id")
+    query = {"user_id": user_id}
+    if game_type:
+        query["game_type"] = game_type
+    
+    total = await db.game_history.count_documents(query)
+    history = await db.game_history.find(
+        query, 
+        {"_id": 0, "server_seed": 0}  # Hide server seed for security
+    ).sort("created_at", -1).skip(offset).limit(limit).to_list(length=limit)
+    
+    return {
+        "success": True,
+        "history": history,
+        "total": total,
+        "limit": limit,
+        "offset": offset
+    }
+
+@api_router.get("/users/{username}/games/active")
+async def get_user_active_games(username: str):
+    """Get user's ongoing games (public view)"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    user = await db.users.find_one(
+        {"kick_username": {"$regex": f"^{username}$", "$options": "i"}},
+        {"_id": 0, "id": 1}
+    )
+    
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    user_id = user.get("id")
+    
+    active_games = await db.game_sessions.find(
+        {"user_id": user_id, "status": "in_progress"},
+        {"_id": 0, "server_seed": 0, "pre_calculated_result": 0}  # Hide sensitive data
+    ).to_list(length=10)
+    
+    # Process games to hide sensitive info but show relevant state
+    processed_games = []
+    for game in active_games:
+        processed = {
+            "session_id": game.get("session_id"),
+            "game_type": game.get("game_type"),
+            "bet_amount": game.get("bet_amount"),
+            "multiplier": game.get("multiplier", 1.0),
+            "created_at": game.get("created_at"),
+            "server_seed_hashed": game.get("server_seed_hashed")
+        }
+        
+        # Add game-specific visible state
+        state = game.get("game_state", {})
+        if game.get("game_type") == "mines":
+            processed["gems_found"] = len(state.get("revealed_tiles", []))
+            processed["num_mines"] = state.get("num_mines", 1)
+        elif game.get("game_type") == "blackjack":
+            processed["player_value"] = state.get("player_value", 0)
+            dealer_hand = state.get("dealer_hand", [])
+            if dealer_hand:
+                processed["dealer_showing"] = dealer_hand[0] if len(dealer_hand) > 0 else None
+        
+        processed_games.append(processed)
+    
+    return {"success": True, "active_games": processed_games}
+
+
+# ==================== ADMIN USER FULL DETAILS ENDPOINTS ====================
+
+@api_router.get("/admin/users/{user_id}/full-details")
+async def admin_get_user_full_details(user_id: str, username: str = Depends(verify_admin)):
+    """Get complete user details including PnL, wagered, spent, redemptions, games"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Get user info
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "access_token": 0, "refresh_token": 0})
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # Get game stats
+    stats_pipeline = [
+        {"$match": {"user_id": user_id}},
+        {"$group": {
+            "_id": None,
+            "total_bets": {"$sum": 1},
+            "total_wagered": {"$sum": "$bet_amount"},
+            "total_won": {"$sum": "$payout"},
+            "wins": {"$sum": {"$cond": [{"$gt": ["$payout", "$bet_amount"]}, 1, 0]}},
+            "losses": {"$sum": {"$cond": [{"$lte": ["$payout", "$bet_amount"]}, 1, 0]}}
+        }}
+    ]
+    stats_result = await db.game_history.aggregate(stats_pipeline).to_list(length=1)
+    stats = stats_result[0] if stats_result else {"total_bets": 0, "total_wagered": 0, "total_won": 0, "wins": 0, "losses": 0}
+    
+    # Stats by game type
+    by_game_pipeline = [
+        {"$match": {"user_id": user_id}},
+        {"$group": {
+            "_id": "$game_type",
+            "bets": {"$sum": 1},
+            "wagered": {"$sum": "$bet_amount"},
+            "won": {"$sum": "$payout"}
+        }}
+    ]
+    by_game_result = await db.game_history.aggregate(by_game_pipeline).to_list(length=10)
+    by_game = {g["_id"]: {"bets": g["bets"], "wagered": round(g["wagered"], 2), "won": round(g["won"], 2), "profit": round(g["won"] - g["wagered"], 2)} for g in by_game_result if g["_id"]}
+    
+    # Get redemptions
+    redemptions = await db.redemptions.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    
+    # Get recent games
+    recent_games = await db.game_history.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).limit(50).to_list(length=50)
+    
+    # Get active games
+    active_games = await db.game_sessions.find({"user_id": user_id, "status": "in_progress"}, {"_id": 0, "server_seed": 0}).to_list(length=10)
+    
+    # Get point adjustments history
+    point_adjustments = await db.point_adjustments.find({"user_id": user_id}, {"_id": 0}).sort("timestamp", -1).limit(20).to_list(length=20)
+    
+    return {
+        "success": True,
+        "user": user,
+        "game_stats": {
+            "total_bets": stats.get("total_bets", 0),
+            "total_wagered": round(stats.get("total_wagered", 0), 2),
+            "total_won": round(stats.get("total_won", 0), 2),
+            "net_profit": round(stats.get("total_won", 0) - stats.get("total_wagered", 0), 2),
+            "wins": stats.get("wins", 0),
+            "losses": stats.get("losses", 0),
+            "win_rate": round((stats.get("wins", 0) / stats.get("total_bets", 1)) * 100, 2) if stats.get("total_bets", 0) > 0 else 0,
+            "by_game": by_game
+        },
+        "redemptions": redemptions,
+        "redemptions_count": len(redemptions),
+        "recent_games": recent_games,
+        "active_games": active_games,
+        "point_adjustments": point_adjustments
+    }
+
+@api_router.get("/admin/users/{user_id}/redemptions")
+async def admin_get_user_redemptions(user_id: str, username: str = Depends(verify_admin)):
+    """Get all redemptions for a specific user"""
+    if db is None:
+        return {"success": True, "redemptions": []}
+    
+    redemptions = await db.redemptions.find({"user_id": user_id}, {"_id": 0}).sort("created_at", -1).to_list(100)
+    
+    # Get counts by status
+    pending = sum(1 for r in redemptions if r.get("status") == "pending")
+    approved = sum(1 for r in redemptions if r.get("status") == "approved")
+    rejected = sum(1 for r in redemptions if r.get("status") == "rejected")
+    
+    total_spent = sum(r.get("points_spent", 0) for r in redemptions)
+    
+    return {
+        "success": True,
+        "redemptions": redemptions,
+        "counts": {"pending": pending, "approved": approved, "rejected": rejected, "total": len(redemptions)},
+        "total_points_spent": total_spent
+    }
+
+
+# ==================== ADMIN GAME BAN ENDPOINTS ====================
+
+@api_router.post("/admin/users/{user_id}/ban-games")
+async def admin_ban_user_from_games(user_id: str, request: Request, username: str = Depends(verify_admin)):
+    """Ban a user from playing games"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "kick_username": 1})
+    
+    result = await db.users.update_one(
+        {"id": user_id},
+        {"$set": {
+            "can_play_games": False,
+            "game_banned_at": datetime.now(timezone.utc).isoformat(),
+            "game_banned_by": username
+        }}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    # End any active game sessions
+    cancelled = await db.game_sessions.update_many(
+        {"user_id": user_id, "status": "in_progress"},
+        {"$set": {"status": "cancelled", "cancelled_reason": "User banned from games"}}
+    )
+    
+    client_ip = request.client.host if request.client else "unknown"
+    await create_audit_log(
+        action="ban_user_games",
+        admin_username=username,
+        target_type="user",
+        target_id=user_id,
+        target_name=user.get("kick_username") if user else None,
+        details={"action": "game_ban", "cancelled_games": cancelled.modified_count},
+        ip_address=client_ip
+    )
+    
+    updated = await db.users.find_one({"id": user_id}, {"_id": 0, "access_token": 0, "refresh_token": 0})
+    return {"success": True, "message": "User banned from playing games", "user": updated}
+
+@api_router.post("/admin/users/{user_id}/unban-games")
+async def admin_unban_user_from_games(user_id: str, request: Request, username: str = Depends(verify_admin)):
+    """Unban a user from playing games"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "kick_username": 1})
+    
+    result = await db.users.update_one(
+        {"id": user_id},
+        {"$set": {"can_play_games": True}, "$unset": {"game_banned_at": "", "game_banned_by": ""}}
+    )
+    
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    client_ip = request.client.host if request.client else "unknown"
+    await create_audit_log(
+        action="unban_user_games",
+        admin_username=username,
+        target_type="user",
+        target_id=user_id,
+        target_name=user.get("kick_username") if user else None,
+        details={"action": "game_unban"},
+        ip_address=client_ip
+    )
+    
+    updated = await db.users.find_one({"id": user_id}, {"_id": 0, "access_token": 0, "refresh_token": 0})
+    return {"success": True, "message": "User can now play games", "user": updated}
+
+
+# ==================== ADMIN SPECIFIC GAME VIEW ENDPOINT ====================
+
+@api_router.get("/admin/games/{game_id}")
+async def admin_get_game_details(game_id: str, username: str = Depends(verify_admin)):
+    """Get full details of a specific game including exact match of what happened"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Try to find in game_history first (completed games)
+    game = await db.game_history.find_one({"id": game_id}, {"_id": 0})
+    game_source = "history"
+    
+    # If not found, check active sessions
+    if not game:
+        game = await db.game_sessions.find_one({"session_id": game_id}, {"_id": 0})
+        game_source = "active"
+    
+    if not game:
+        raise HTTPException(status_code=404, detail="Game not found")
+    
+    # Get user info
+    user_id = game.get("user_id")
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "kick_username": 1, "avatar": 1, "id": 1})
+    
+    # Prepare detailed response based on game type
+    game_type = game.get("game_type")
+    game_data = game.get("game_data", {}) or game.get("game_state", {})
+    
+    response = {
+        "success": True,
+        "game_source": game_source,
+        "game": {
+            "id": game.get("id") or game.get("session_id"),
+            "game_type": game_type,
+            "user_id": user_id,
+            "user": user,
+            "bet_amount": game.get("bet_amount"),
+            "payout": game.get("payout", 0),
+            "profit": game.get("profit", game.get("payout", 0) - game.get("bet_amount", 0)),
+            "won": game.get("won", game.get("payout", 0) > game.get("bet_amount", 0)),
+            "multiplier": game.get("multiplier", 1.0),
+            "status": game.get("status", "completed"),
+            "created_at": game.get("created_at"),
+            "completed_at": game.get("completed_at"),
+            "fairness": {
+                "server_seed": game.get("server_seed"),
+                "server_seed_hashed": game.get("server_seed_hashed"),
+                "client_seed": game.get("client_seed"),
+                "nonce": game.get("nonce")
+            }
+        },
+        "game_details": {}
+    }
+    
+    # Add game-specific details
+    if game_type == "dice":
+        response["game_details"] = {
+            "roll_result": game_data.get("result") or game_data.get("roll"),
+            "target": game_data.get("target"),
+            "roll_over": game_data.get("roll_over"),
+            "win_chance": game_data.get("win_chance")
+        }
+    elif game_type == "limbo":
+        response["game_details"] = {
+            "result_multiplier": game_data.get("result") or game_data.get("multiplier_result"),
+            "target_multiplier": game_data.get("target") or game_data.get("target_multiplier")
+        }
+    elif game_type == "mines":
+        response["game_details"] = {
+            "num_mines": game_data.get("num_mines"),
+            "mine_positions": game_data.get("mine_positions", []),
+            "revealed_tiles": game_data.get("revealed_tiles", []),
+            "gems_found": len(game_data.get("revealed_tiles", [])),
+            "hit_mine": game_data.get("hit_mine", False),
+            "cashed_out": game_data.get("cashed_out", False)
+        }
+    elif game_type == "blackjack":
+        response["game_details"] = {
+            "player_hand": game_data.get("player_hand", []),
+            "dealer_hand": game_data.get("dealer_hand", []),
+            "player_value": game_data.get("player_value"),
+            "dealer_value": game_data.get("dealer_value"),
+            "result": game_data.get("result"),
+            "doubled": game_data.get("doubled", False),
+            "player_blackjack": game_data.get("player_blackjack", False),
+            "dealer_blackjack": game_data.get("dealer_blackjack", False)
+        }
+    elif game_type == "wheel":
+        response["game_details"] = {
+            "segments": game_data.get("segments"),
+            "risk": game_data.get("risk"),
+            "winning_segment": game_data.get("segment_index") or game_data.get("winning_segment"),
+            "result_multiplier": game_data.get("multiplier") or game_data.get("result_multiplier")
+        }
+    
+    return response
+
+
+# ==================== ADMIN ALL GAMES ENDPOINT ====================
+
+@api_router.get("/admin/games/all")
+async def admin_get_all_games(
+    status: Optional[str] = None,  # "ongoing", "ended", or None for all
+    game_type: Optional[str] = None,
+    user_id: Optional[str] = None,
+    search: Optional[str] = None,
+    limit: int = 50,
+    offset: int = 0,
+    username: str = Depends(verify_admin)
+):
+    """Get all games with filters (ongoing, ended, or all)"""
+    if db is None:
+        return {"success": True, "games": [], "total": 0}
+    
+    games = []
+    total_ongoing = 0
+    total_ended = 0
+    
+    # Build query for active games
+    active_query = {"status": "in_progress"}
+    if game_type:
+        active_query["game_type"] = game_type
+    if user_id:
+        active_query["user_id"] = user_id
+    
+    # Build query for game history
+    history_query = {}
+    if game_type:
+        history_query["game_type"] = game_type
+    if user_id:
+        history_query["user_id"] = user_id
+    if search:
+        # We'll need to search by username, so get user IDs first
+        matching_users = await db.users.find(
+            {"kick_username": {"$regex": search, "$options": "i"}},
+            {"id": 1}
+        ).to_list(100)
+        user_ids = [u["id"] for u in matching_users]
+        if user_ids:
+            history_query["user_id"] = {"$in": user_ids}
+            active_query["user_id"] = {"$in": user_ids}
+    
+    # Get counts
+    total_ongoing = await db.game_sessions.count_documents({"status": "in_progress"})
+    total_ended = await db.game_history.count_documents({})
+    
+    if status == "ongoing":
+        # Only get active games
+        active_games = await db.game_sessions.find(active_query, {"_id": 0, "server_seed": 0, "pre_calculated_result": 0}).sort("created_at", -1).skip(offset).limit(limit).to_list(length=limit)
+        
+        # Enrich with user info
+        for game in active_games:
+            user = await db.users.find_one({"id": game.get("user_id")}, {"_id": 0, "kick_username": 1, "avatar": 1})
+            game["user"] = user
+            game["id"] = game.get("session_id")
+            game["status"] = "ongoing"
+            games.append(game)
+        
+        total = await db.game_sessions.count_documents(active_query)
+        
+    elif status == "ended":
+        # Only get completed games
+        history = await db.game_history.find(history_query, {"_id": 0}).sort("created_at", -1).skip(offset).limit(limit).to_list(length=limit)
+        
+        # Enrich with user info
+        for game in history:
+            user = await db.users.find_one({"id": game.get("user_id")}, {"_id": 0, "kick_username": 1, "avatar": 1})
+            game["user"] = user
+            game["status"] = "ended"
+            games.append(game)
+        
+        total = await db.game_history.count_documents(history_query)
+        
+    else:
+        # Get both active and completed games, sorted by date
+        # First get active games
+        active_games = await db.game_sessions.find(active_query, {"_id": 0, "server_seed": 0, "pre_calculated_result": 0}).sort("created_at", -1).to_list(length=100)
+        
+        for game in active_games:
+            user = await db.users.find_one({"id": game.get("user_id")}, {"_id": 0, "kick_username": 1, "avatar": 1})
+            game["user"] = user
+            game["id"] = game.get("session_id")
+            game["status"] = "ongoing"
+            games.append(game)
+        
+        # Then get completed games
+        remaining = limit - len(games) if len(games) < limit else 0
+        if remaining > 0 or len(games) == 0:
+            skip_history = max(0, offset - len(active_games)) if offset > len(active_games) else 0
+            history = await db.game_history.find(history_query, {"_id": 0}).sort("created_at", -1).skip(skip_history).limit(remaining if remaining > 0 else limit).to_list(length=remaining if remaining > 0 else limit)
+            
+            for game in history:
+                user = await db.users.find_one({"id": game.get("user_id")}, {"_id": 0, "kick_username": 1, "avatar": 1})
+                game["user"] = user
+                game["status"] = "ended"
+                games.append(game)
+        
+        # Sort all by created_at
+        games.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+        games = games[offset:offset+limit] if status is None else games
+        
+        total = await db.game_sessions.count_documents(active_query) + await db.game_history.count_documents(history_query)
+    
+    return {
+        "success": True,
+        "games": games,
+        "total": total,
+        "counts": {
+            "ongoing": total_ongoing,
+            "ended": total_ended,
+            "all": total_ongoing + total_ended
+        },
+        "limit": limit,
+        "offset": offset
+    }
 
 
 # Include router
