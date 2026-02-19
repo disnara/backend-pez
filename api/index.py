@@ -2626,6 +2626,11 @@ class VerifyGameRequest(BaseModel):
     game_type: GameTypeEnum
     game_params: Optional[dict] = {}
 
+class WheelBetRequest(BaseModel):
+    bet_amount: float = Field(..., gt=0, le=MAX_BET_AMOUNT)
+    risk: str = Field(...)
+    segments: int = Field(...)
+
 # ============================================
 # PROVABLY FAIR CORE FUNCTIONS
 # ============================================
@@ -2755,6 +2760,37 @@ def calculate_mines_multiplier(revealed: int, num_mines: int, grid_size: int = 2
     
     return round(multiplier, 4)
 
+# Wheel game segment configurations (1% house edge)
+WHEEL_CONFIGS = {
+    10: {
+        "low": [0, 1.2, 1.2, 1.2, 1.2, 1.2, 1.5, 1.5, 1.5, 2],
+        "medium": [0, 0, 0, 1.5, 1.5, 1.5, 1.5, 2, 2, 3],
+        "high": [0, 0, 0, 0, 0, 2, 2, 5, 5, 10]
+    },
+    20: {
+        "low": [0, 0, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.5, 1.5, 1.5, 1.5, 1.5, 2, 2, 3],
+        "medium": [0, 0, 0, 0, 0, 0, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 2, 2, 2, 2, 3, 3, 5, 5],
+        "high": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 3, 3, 3, 5, 5, 10]
+    },
+    50: {
+        "low": [0, 0, 0, 0, 0, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.1, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.2, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 2, 2, 2, 3],
+        "medium": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 5, 5, 5, 5, 10],
+        "high": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 24]
+    }
+}
+
+def calculate_wheel_result(server_seed: str, client_seed: str, nonce: int, segments: int) -> int:
+    """Calculate which segment the wheel lands on (0 to segments-1)"""
+    hmac_hex = generate_hmac_result(server_seed, client_seed, nonce)
+    float_value = hmac_to_float(hmac_hex)
+    return int(float_value * segments)
+
+def get_wheel_multiplier(segment_index: int, segments: int, risk: str) -> float:
+    """Get the multiplier for a specific wheel segment"""
+    config = WHEEL_CONFIGS.get(segments, WHEEL_CONFIGS[10])
+    multipliers = config.get(risk, config["low"])
+    return multipliers[segment_index % len(multipliers)]
+
 def verify_game_result(server_seed: str, server_seed_hashed: str, client_seed: str, nonce: int, game_type: str, game_params: dict) -> Dict[str, Any]:
     """Verify a game result is fair"""
     calculated_hash = hash_server_seed(server_seed)
@@ -2768,6 +2804,11 @@ def verify_game_result(server_seed: str, server_seed_hashed: str, client_seed: s
         result = calculate_mines_grid(server_seed, client_seed, nonce, game_params.get('num_mines', 3))
     elif game_type == "blackjack":
         result = calculate_blackjack_deck(server_seed, client_seed, nonce)
+    elif game_type == "wheel":
+        segments = game_params.get('segments', 10)
+        risk = game_params.get('risk', 'low')
+        segment_index = calculate_wheel_result(server_seed, client_seed, nonce, segments)
+        result = {"segment_index": segment_index, "multiplier": get_wheel_multiplier(segment_index, segments, risk)}
     else:
         result = None
     
@@ -2979,6 +3020,98 @@ async def play_dice(request_data: DiceBetRequest, request: Request):
             "client_seed": seeds['client_seed'],
             "nonce": seeds['nonce']
         }
+    }
+
+# ============================================
+# WHEEL GAME ENDPOINT
+# ============================================
+
+@api_router.post("/games/wheel/spin")
+async def play_wheel(request_data: WheelBetRequest, request: Request):
+    """Spin the wheel"""
+    user = await get_current_user(request)
+    user_id = str(user['id'])
+    
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Validate inputs
+    if request_data.risk not in ["low", "medium", "high"]:
+        raise HTTPException(status_code=400, detail="Invalid risk level")
+    if request_data.segments not in [10, 20, 50]:
+        raise HTTPException(status_code=400, detail="Invalid segment count")
+    
+    db_user = await db.users.find_one({"id": user_id})
+    if not db_user or db_user.get('points_balance', 0) < request_data.bet_amount:
+        raise HTTPException(status_code=400, detail="Insufficient balance")
+    
+    seeds = await db.user_seeds.find_one({"user_id": user_id})
+    if not seeds:
+        raise HTTPException(status_code=400, detail="Please initialize seeds first")
+    
+    # Calculate result
+    segment_index = calculate_wheel_result(seeds['server_seed'], seeds['client_seed'], seeds['nonce'], request_data.segments)
+    multiplier = get_wheel_multiplier(segment_index, request_data.segments, request_data.risk)
+    
+    won = multiplier > 0
+    payout = request_data.bet_amount * multiplier if won else 0
+    profit = payout - request_data.bet_amount
+    
+    new_balance = db_user['points_balance'] - request_data.bet_amount + payout
+    await db.users.update_one({"id": user_id}, {"$set": {"points_balance": new_balance}})
+    await db.user_seeds.update_one({"user_id": user_id}, {"$inc": {"nonce": 1}})
+    
+    # Get all multipliers for the wheel display
+    config = WHEEL_CONFIGS.get(request_data.segments, WHEEL_CONFIGS[10])
+    wheel_multipliers = config.get(request_data.risk, config["low"])
+    
+    history_doc = {
+        "user_id": user_id,
+        "kick_username": db_user.get("kick_username", "Unknown"),
+        "game_type": "wheel",
+        "bet_amount": request_data.bet_amount,
+        "multiplier": multiplier,
+        "payout": payout,
+        "profit": profit,
+        "server_seed": seeds['server_seed'],
+        "server_seed_hashed": seeds['server_seed_hashed'],
+        "client_seed": seeds['client_seed'],
+        "nonce": seeds['nonce'],
+        "game_data": {
+            "segments": request_data.segments,
+            "risk": request_data.risk,
+            "segment_index": segment_index,
+            "won": won
+        },
+        "status": "completed",
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.game_history.insert_one(history_doc)
+    
+    return {
+        "success": True,
+        "result": {
+            "segment_index": segment_index,
+            "multiplier": multiplier,
+            "won": won,
+            "payout": payout,
+            "profit": profit,
+            "new_balance": new_balance,
+            "wheel_multipliers": wheel_multipliers
+        },
+        "fairness": {
+            "server_seed_hashed": seeds['server_seed_hashed'],
+            "client_seed": seeds['client_seed'],
+            "nonce": seeds['nonce']
+        }
+    }
+
+@api_router.get("/games/wheel/config")
+async def get_wheel_config():
+    """Get wheel configuration for all risk levels and segments"""
+    return {
+        "success": True,
+        "configs": WHEEL_CONFIGS
     }
 
 # ============================================
