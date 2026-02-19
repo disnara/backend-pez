@@ -3655,9 +3655,201 @@ async def get_active_games(request: Request):
     
     return {"success": True, "active_games": active_sessions}
 
+@api_router.get("/games/active/{game_type}")
+async def get_active_game_by_type(game_type: str, request: Request):
+    """
+    Get user's active game session for a specific game type.
+    Used to restore game state when user refreshes the page.
+    """
+    try:
+        user = await get_current_user(request)
+    except HTTPException:
+        return {"success": False, "active_game": None, "error": "Not authenticated"}
+    
+    if db is None:
+        return {"success": False, "active_game": None, "error": "Database not available"}
+    
+    user_id = str(user['id'])
+    
+    # Find active game for this user and game type
+    active_game = await db.game_sessions.find_one({
+        "user_id": user_id,
+        "game_type": game_type,
+        "status": "in_progress"
+    })
+    
+    if not active_game:
+        return {"success": True, "active_game": None}
+    
+    # Prepare response - hide sensitive data
+    game_data = {
+        "session_id": active_game["session_id"],
+        "game_type": active_game["game_type"],
+        "bet_amount": active_game["bet_amount"],
+        "multiplier": active_game.get("multiplier", 1.0),
+        "created_at": active_game.get("created_at"),
+        "game_state": active_game.get("game_state", {}),
+        "fairness": {
+            "server_seed_hashed": active_game.get("server_seed_hashed"),
+            "client_seed": active_game.get("client_seed"),
+            "nonce": active_game.get("nonce")
+        }
+    }
+    
+    # For blackjack, include visible cards but hide dealer's second card
+    if game_type == "blackjack":
+        state = active_game.get("game_state", {})
+        game_data["player_hand"] = state.get("player_hand", [])
+        game_data["player_value"] = state.get("player_value", 0)
+        dealer_hand = state.get("dealer_hand", [])
+        if len(dealer_hand) > 0:
+            game_data["dealer_hand"] = [dealer_hand[0]]
+            # Calculate visible dealer value
+            card = dealer_hand[0]
+            card_val = card.get('value', card.get('rank', ''))
+            if card_val in ['J', 'Q', 'K']:
+                game_data["dealer_visible_value"] = 10
+            elif card_val == 'A':
+                game_data["dealer_visible_value"] = 11
+            else:
+                try:
+                    game_data["dealer_visible_value"] = int(card_val)
+                except:
+                    game_data["dealer_visible_value"] = 10
+        game_data["doubled"] = state.get("doubled", False)
+    
+    # For mines, include revealed tiles
+    if game_type == "mines":
+        state = active_game.get("game_state", {})
+        game_data["revealed_tiles"] = state.get("revealed_tiles", [])
+        game_data["num_mines"] = state.get("num_mines", 1)
+        game_data["gems_found"] = len(state.get("revealed_tiles", []))
+    
+    return {"success": True, "active_game": game_data}
+
 # ============================================
 # ADMIN GAME ENDPOINTS
 # ============================================
+
+@api_router.get("/admin/active-games")
+async def admin_get_active_games(
+    game_type: Optional[str] = None,
+    username: str = Depends(verify_admin)
+):
+    """Get all active game sessions across all users."""
+    if db is None:
+        return {"success": False, "active_games": [], "error": "Database not available"}
+    
+    query = {"status": "in_progress"}
+    if game_type and game_type != "all":
+        query["game_type"] = game_type
+    
+    active_games = await db.game_sessions.find(query).sort("created_at", -1).to_list(100)
+    
+    enriched_games = []
+    for game in active_games:
+        user = await db.users.find_one({"id": game["user_id"]}, {"_id": 0, "kick_username": 1})
+        
+        enriched_games.append({
+            "session_id": game["session_id"],
+            "user_id": game["user_id"],
+            "kick_username": user.get("kick_username", "Unknown") if user else "Unknown",
+            "game_type": game["game_type"],
+            "bet_amount": game["bet_amount"],
+            "multiplier": game.get("multiplier", 1.0),
+            "potential_payout": game["bet_amount"] * game.get("multiplier", 1.0),
+            "created_at": game.get("created_at"),
+            "game_state": {
+                "revealed_tiles": game.get("game_state", {}).get("revealed_tiles", []) if game["game_type"] == "mines" else None,
+                "num_mines": game.get("game_state", {}).get("num_mines") if game["game_type"] == "mines" else None,
+                "player_hand": game.get("game_state", {}).get("player_hand") if game["game_type"] == "blackjack" else None,
+                "player_value": game.get("game_state", {}).get("player_value") if game["game_type"] == "blackjack" else None,
+            }
+        })
+    
+    counts = {
+        "total": len(enriched_games),
+        "mines": len([g for g in enriched_games if g["game_type"] == "mines"]),
+        "blackjack": len([g for g in enriched_games if g["game_type"] == "blackjack"])
+    }
+    
+    return {"success": True, "active_games": enriched_games, "counts": counts}
+
+
+@api_router.post("/admin/active-games/{session_id}/end")
+async def admin_end_active_game(session_id: str, username: str = Depends(verify_admin)):
+    """Admin force-ends an active game. Returns bet amount to player."""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    game = await db.game_sessions.find_one({"session_id": session_id, "status": "in_progress"})
+    if not game:
+        raise HTTPException(status_code=404, detail="Active game not found")
+    
+    user_id = game["user_id"]
+    bet_amount = game["bet_amount"]
+    
+    # Refund bet
+    await db.users.update_one({"id": user_id}, {"$inc": {"points_balance": bet_amount}})
+    
+    # Mark as cancelled
+    await db.game_sessions.update_one(
+        {"session_id": session_id},
+        {"$set": {
+            "status": "cancelled",
+            "cancelled_by": "admin",
+            "cancelled_reason": "Admin force-ended game",
+            "payout": bet_amount,
+            "profit": 0,
+            "completed_at": datetime.now(timezone.utc).isoformat()
+        }}
+    )
+    
+    user = await db.users.find_one({"id": user_id}, {"_id": 0, "kick_username": 1, "points_balance": 1})
+    
+    return {
+        "success": True,
+        "message": f"Game ended. Refunded {bet_amount} points",
+        "refunded_amount": bet_amount,
+        "user_new_balance": user.get("points_balance", 0) if user else 0
+    }
+
+
+@api_router.post("/admin/active-games/end-all")
+async def admin_end_all_active_games(game_type: Optional[str] = None, username: str = Depends(verify_admin)):
+    """Admin force-ends all active games. Returns bets to all players."""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    query = {"status": "in_progress"}
+    if game_type and game_type != "all":
+        query["game_type"] = game_type
+    
+    active_games = await db.game_sessions.find(query).to_list(1000)
+    
+    if not active_games:
+        return {"success": True, "message": "No active games", "ended_count": 0}
+    
+    ended_count = 0
+    total_refunded = 0
+    
+    for game in active_games:
+        await db.users.update_one({"id": game["user_id"]}, {"$inc": {"points_balance": game["bet_amount"]}})
+        await db.game_sessions.update_one(
+            {"session_id": game["session_id"]},
+            {"$set": {
+                "status": "cancelled",
+                "cancelled_by": "admin_bulk",
+                "cancelled_reason": "Admin bulk-ended all active games",
+                "payout": game["bet_amount"],
+                "profit": 0,
+                "completed_at": datetime.now(timezone.utc).isoformat()
+            }}
+        )
+        ended_count += 1
+        total_refunded += game["bet_amount"]
+    
+    return {"success": True, "ended_count": ended_count, "total_refunded": total_refunded}
 
 @api_router.get("/admin/game-history")
 async def admin_get_game_history(
