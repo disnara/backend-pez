@@ -269,6 +269,11 @@ class StatusCheck(BaseModel):
 class StatusCheckCreate(BaseModel):
     client_name: str
 
+class KenoBetRequest(BaseModel):
+    bet_amount: float
+    selected_numbers: List[int]
+    risk: str = "low"
+
 class ChallengeCreate(BaseModel):
     site: str
     site_logo: str
@@ -851,6 +856,7 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
                 return RedirectResponse(url=f"{FRONTEND_URL}/?error=user_fetch_failed")
             
             kick_user = user_response.json()
+            logger.info(f"Kick user response: {kick_user}")  # Debug logging
             
             if isinstance(kick_user, list) and len(kick_user) > 0:
                 kick_user = kick_user[0]
@@ -861,6 +867,8 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
                         kick_user = kick_user[0]
                 elif "user" in kick_user:
                     kick_user = kick_user["user"]
+            
+            logger.info(f"Parsed kick_user: {kick_user}")  # Debug logging
             
             kick_username = kick_user.get("username") or kick_user.get("name") or "Unknown"
             kick_user_id = kick_user.get("user_id") or kick_user.get("id")
@@ -910,7 +918,30 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
     if db is not None:
         kick_id = str(kick_user.get("id") or kick_user.get("user_id") or "")
         kick_username = kick_user.get("username") or kick_user.get("name") or "User"
-        avatar = kick_user.get("profile_pic") or kick_user.get("avatar") or ""
+        
+        # Try multiple possible field names for profile picture
+        avatar = (
+            kick_user.get("profilepic") or 
+            kick_user.get("profile_pic") or 
+            kick_user.get("profile_picture") or
+            kick_user.get("profilePicture") or
+            kick_user.get("avatar") or
+            kick_user.get("image") or
+            ""
+        )
+        
+        # Check if avatar might be nested in a profile or images object
+        if not avatar:
+            profile = kick_user.get("profile") or {}
+            if isinstance(profile, dict):
+                avatar = profile.get("profile_pic") or profile.get("profilepic") or profile.get("avatar") or ""
+        
+        if not avatar:
+            images = kick_user.get("images") or {}
+            if isinstance(images, dict):
+                avatar = images.get("avatar") or images.get("profile") or ""
+        
+        logger.info(f"Extracted avatar URL: {avatar}")  # Debug logging
         
         existing_user = await db.users.find_one({"kick_id": kick_id})
         
@@ -3122,6 +3153,59 @@ def get_wheel_multiplier(segment_index: int, segments: int, risk: str) -> float:
     multipliers = config.get(risk, config["low"])
     return multipliers[segment_index % len(multipliers)]
 
+def calculate_keno_draw(server_seed: str, client_seed: str, nonce: int, total_numbers: int = 40, draw_count: int = 10) -> List[int]:
+    """Calculate which numbers are drawn in Keno"""
+    drawn = []
+    available = list(range(1, total_numbers + 1))
+    
+    for i in range(draw_count):
+        hmac_hex = generate_hmac_result(server_seed, client_seed, nonce * 100 + i)
+        float_value = hmac_to_float(hmac_hex)
+        index = int(float_value * len(available))
+        drawn.append(available.pop(index))
+    
+    return sorted(drawn)
+
+# Keno payout tables
+KENO_PAYOUTS = {
+    "low": {
+        1: {0: 0, 1: 2.75},
+        2: {0: 0, 1: 1.5, 2: 4.5},
+        3: {0: 0, 1: 1, 2: 2, 3: 8},
+        4: {0: 0, 1: 0.5, 2: 1.5, 3: 3, 4: 12},
+        5: {0: 0, 1: 0.3, 2: 1, 3: 2, 4: 5, 5: 18},
+        6: {0: 0, 1: 0.2, 2: 0.5, 3: 1.5, 4: 3, 5: 8, 6: 25},
+        7: {0: 0, 1: 0.1, 2: 0.3, 3: 1, 4: 2, 5: 5, 6: 12, 7: 40},
+        8: {0: 0, 1: 0, 2: 0.2, 3: 0.5, 4: 1.5, 5: 3, 6: 8, 7: 20, 8: 60},
+        9: {0: 0, 1: 0, 2: 0.1, 3: 0.3, 4: 1, 5: 2, 6: 5, 7: 12, 8: 35, 9: 90},
+        10: {0: 0, 1: 0, 2: 0, 3: 0.2, 4: 0.5, 5: 1.5, 6: 3, 7: 8, 8: 20, 9: 50, 10: 150}
+    },
+    "medium": {
+        1: {0: 0, 1: 3.5},
+        2: {0: 0, 1: 1.2, 2: 6},
+        3: {0: 0, 1: 0.5, 2: 2.5, 3: 15},
+        4: {0: 0, 1: 0.3, 2: 1.5, 3: 5, 4: 25},
+        5: {0: 0, 1: 0.2, 2: 0.8, 3: 3, 4: 10, 5: 40},
+        6: {0: 0, 1: 0.1, 2: 0.5, 3: 2, 4: 6, 5: 18, 6: 60},
+        7: {0: 0, 1: 0, 2: 0.3, 3: 1.2, 4: 4, 5: 10, 6: 30, 7: 100},
+        8: {0: 0, 1: 0, 2: 0.2, 3: 0.8, 4: 2.5, 5: 7, 6: 20, 7: 50, 8: 150},
+        9: {0: 0, 1: 0, 2: 0.1, 3: 0.5, 4: 1.5, 5: 5, 6: 12, 7: 35, 8: 80, 9: 250},
+        10: {0: 0, 1: 0, 2: 0, 3: 0.3, 4: 1, 5: 3, 6: 8, 7: 22, 8: 55, 9: 130, 10: 400}
+    },
+    "high": {
+        1: {0: 0, 1: 4},
+        2: {0: 0, 1: 0.8, 2: 10},
+        3: {0: 0, 1: 0.3, 2: 2, 3: 30},
+        4: {0: 0, 1: 0.2, 2: 1, 3: 6, 4: 60},
+        5: {0: 0, 1: 0.1, 2: 0.5, 3: 3, 4: 15, 5: 100},
+        6: {0: 0, 1: 0, 2: 0.3, 3: 1.5, 4: 8, 5: 35, 6: 180},
+        7: {0: 0, 1: 0, 2: 0.2, 3: 1, 4: 5, 5: 18, 6: 70, 7: 300},
+        8: {0: 0, 1: 0, 2: 0.1, 3: 0.5, 4: 3, 5: 10, 6: 40, 7: 130, 8: 500},
+        9: {0: 0, 1: 0, 2: 0, 3: 0.3, 4: 2, 5: 6, 6: 22, 7: 80, 8: 250, 9: 800},
+        10: {0: 0, 1: 0, 2: 0, 3: 0.2, 4: 1, 5: 4, 6: 12, 7: 50, 8: 150, 9: 450, 10: 1500}
+    }
+}
+
 def verify_game_result(server_seed: str, server_seed_hashed: str, client_seed: str, nonce: int, game_type: str, game_params: dict) -> Dict[str, Any]:
     """Verify a game result is fair"""
     calculated_hash = hash_server_seed(server_seed)
@@ -3519,6 +3603,103 @@ async def play_limbo(request_data: LimboBetRequest, request: Request):
             "profit": profit,
             "new_balance": new_balance
         },
+        "fairness": {
+            "server_seed_hashed": seeds['server_seed_hashed'],
+            "client_seed": seeds['client_seed'],
+            "nonce": seeds['nonce']
+        }
+    }
+
+# ============================================
+# KENO GAME ENDPOINT
+# ============================================
+
+@api_router.post("/games/keno/bet")
+async def play_keno(request_data: KenoBetRequest, request: Request):
+    """Place a Keno bet"""
+    user = await get_current_user(request)
+    user_id = str(user['id'])
+    
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Validate input
+    if not request_data.selected_numbers or len(request_data.selected_numbers) < 1 or len(request_data.selected_numbers) > 10:
+        raise HTTPException(status_code=400, detail="Select between 1 and 10 numbers")
+    
+    if any(n < 1 or n > 40 for n in request_data.selected_numbers):
+        raise HTTPException(status_code=400, detail="Numbers must be between 1 and 40")
+    
+    if len(request_data.selected_numbers) != len(set(request_data.selected_numbers)):
+        raise HTTPException(status_code=400, detail="Duplicate numbers not allowed")
+    
+    if request_data.risk not in ["low", "medium", "high"]:
+        raise HTTPException(status_code=400, detail="Invalid risk level")
+    
+    db_user = await db.users.find_one({"id": user_id})
+    if not db_user:
+        raise HTTPException(status_code=400, detail="User not found")
+    if db_user.get('can_play_games') == False:
+        raise HTTPException(status_code=403, detail="You are banned from playing games")
+    if db_user.get('points_balance', 0) < request_data.bet_amount:
+        raise HTTPException(status_code=400, detail="Insufficient balance")
+    
+    seeds = await db.user_seeds.find_one({"user_id": user_id})
+    if not seeds:
+        raise HTTPException(status_code=400, detail="Please initialize seeds first")
+    
+    # Calculate drawn numbers
+    drawn_numbers = calculate_keno_draw(seeds['server_seed'], seeds['client_seed'], seeds['nonce'])
+    
+    # Calculate hits
+    hits = len(set(request_data.selected_numbers) & set(drawn_numbers))
+    picks = len(request_data.selected_numbers)
+    
+    # Get payout multiplier
+    payout_table = KENO_PAYOUTS.get(request_data.risk, KENO_PAYOUTS["low"])
+    multiplier = payout_table.get(picks, {}).get(hits, 0)
+    
+    payout = request_data.bet_amount * multiplier
+    profit = payout - request_data.bet_amount
+    won = payout > 0
+    
+    new_balance = db_user['points_balance'] - request_data.bet_amount + payout
+    await db.users.update_one({"id": user_id}, {"$set": {"points_balance": new_balance}})
+    await db.user_seeds.update_one({"user_id": user_id}, {"$inc": {"nonce": 1}})
+    
+    history_doc = {
+        "id": str(uuid.uuid4()),
+        "user_id": user_id,
+        "kick_username": db_user.get("kick_username", "Unknown"),
+        "game_type": "keno",
+        "bet_amount": request_data.bet_amount,
+        "multiplier": multiplier,
+        "payout": payout,
+        "profit": profit,
+        "won": won,
+        "server_seed": seeds['server_seed'],
+        "server_seed_hashed": seeds['server_seed_hashed'],
+        "client_seed": seeds['client_seed'],
+        "nonce": seeds['nonce'],
+        "game_data": {
+            "selected_numbers": request_data.selected_numbers,
+            "drawn_numbers": drawn_numbers,
+            "hits": hits,
+            "risk": request_data.risk
+        },
+        "created_at": datetime.now(timezone.utc).isoformat()
+    }
+    await db.game_history.insert_one(history_doc)
+    
+    return {
+        "success": True,
+        "drawn_numbers": drawn_numbers,
+        "hits": hits,
+        "multiplier": multiplier,
+        "payout": payout,
+        "profit": profit,
+        "won": won,
+        "new_balance": new_balance,
         "fairness": {
             "server_seed_hashed": seeds['server_seed_hashed'],
             "client_seed": seeds['client_seed'],
