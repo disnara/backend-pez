@@ -540,7 +540,7 @@ async def root():
 
 @api_router.get("/health")
 async def health_check():
-    return {"status": "healthy", "database": "connected" if db else "not_connected"}
+    return {"status": "healthy", "database": "connected" if db is not None else "not_connected"}
 
 
 # ==================== LEADERBOARD SETTINGS ====================
@@ -987,7 +987,8 @@ async def kick_callback(request: Request, code: str = None, state: str = None, e
     
     jwt_token = create_jwt_token(user_id, kick_username, is_admin)
     
-    response = RedirectResponse(url=f"{FRONTEND_URL}/index.html")
+    # Pass token in URL for cross-domain compatibility, frontend will store it
+    response = RedirectResponse(url=f"{FRONTEND_URL}/index.html?token={jwt_token}")
     response.set_cookie(key="auth_token", value=jwt_token, httponly=True, secure=True, samesite="none", max_age=7*24*60*60)
     return response
 
