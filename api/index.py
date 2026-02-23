@@ -3240,6 +3240,37 @@ def verify_game_result(server_seed: str, server_seed_hashed: str, client_seed: s
 # GAME SEED MANAGEMENT ENDPOINTS
 # ============================================
 
+async def get_or_create_seeds(user_id: str, client_seed: Optional[str] = None):
+    """Helper function to get existing seeds or create new ones automatically"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    existing = await db.user_seeds.find_one({"user_id": user_id})
+    
+    if existing:
+        return existing
+    
+    # Auto-create seeds if they don't exist
+    server_seed = generate_server_seed()
+    next_server_seed = generate_server_seed()
+    auto_client_seed = client_seed or f"pez_{user_id}_{int(datetime.now().timestamp())}"
+    
+    seed_doc = {
+        "user_id": user_id,
+        "server_seed": server_seed,
+        "server_seed_hashed": hash_server_seed(server_seed),
+        "next_server_seed": next_server_seed,
+        "next_server_seed_hashed": hash_server_seed(next_server_seed),
+        "client_seed": auto_client_seed,
+        "nonce": 0,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat()
+    }
+    
+    await db.user_seeds.insert_one(seed_doc)
+    logger.info(f"Auto-initialized seeds for user {user_id}")
+    return seed_doc
+
 @api_router.post("/games/seeds/init")
 async def initialize_seeds(request_data: InitSeedsRequest, request: Request):
     """Initialize or get user's provably fair seeds"""
@@ -3372,10 +3403,8 @@ async def play_dice(request_data: DiceBetRequest, request: Request):
     if db_user.get('points_balance', 0) < request_data.bet_amount:
         raise HTTPException(status_code=400, detail="Insufficient balance")
     
-    # Get user seeds
-    seeds = await db.user_seeds.find_one({"user_id": user_id})
-    if not seeds:
-        raise HTTPException(status_code=400, detail="Please initialize seeds first")
+    # Get user seeds (auto-create if not exist)
+    seeds = await get_or_create_seeds(user_id)
     
     # Pre-calculate result
     roll_result = calculate_dice_result(seeds['server_seed'], seeds['client_seed'], seeds['nonce'])
@@ -3469,9 +3498,7 @@ async def play_wheel(request_data: WheelBetRequest, request: Request):
     if db_user.get('points_balance', 0) < request_data.bet_amount:
         raise HTTPException(status_code=400, detail="Insufficient balance")
     
-    seeds = await db.user_seeds.find_one({"user_id": user_id})
-    if not seeds:
-        raise HTTPException(status_code=400, detail="Please initialize seeds first")
+    seeds = await get_or_create_seeds(user_id)
     
     # Calculate result
     segment_index = calculate_wheel_result(seeds['server_seed'], seeds['client_seed'], seeds['nonce'], request_data.segments)
@@ -3559,9 +3586,7 @@ async def play_limbo(request_data: LimboBetRequest, request: Request):
     if db_user.get('points_balance', 0) < request_data.bet_amount:
         raise HTTPException(status_code=400, detail="Insufficient balance")
     
-    seeds = await db.user_seeds.find_one({"user_id": user_id})
-    if not seeds:
-        raise HTTPException(status_code=400, detail="Please initialize seeds first")
+    seeds = await get_or_create_seeds(user_id)
     
     result_multiplier = calculate_limbo_result(seeds['server_seed'], seeds['client_seed'], seeds['nonce'])
     
@@ -3645,9 +3670,7 @@ async def play_keno(request_data: KenoBetRequest, request: Request):
     if db_user.get('points_balance', 0) < request_data.bet_amount:
         raise HTTPException(status_code=400, detail="Insufficient balance")
     
-    seeds = await db.user_seeds.find_one({"user_id": user_id})
-    if not seeds:
-        raise HTTPException(status_code=400, detail="Please initialize seeds first")
+    seeds = await get_or_create_seeds(user_id)
     
     # Calculate drawn numbers
     drawn_numbers = calculate_keno_draw(seeds['server_seed'], seeds['client_seed'], seeds['nonce'])
@@ -3734,9 +3757,7 @@ async def start_mines(request_data: MinesStartRequest, request: Request):
     if active_game:
         raise HTTPException(status_code=400, detail="You have an active mines game")
     
-    seeds = await db.user_seeds.find_one({"user_id": user_id})
-    if not seeds:
-        raise HTTPException(status_code=400, detail="Please initialize seeds first")
+    seeds = await get_or_create_seeds(user_id)
     
     mine_positions = calculate_mines_grid(seeds['server_seed'], seeds['client_seed'], seeds['nonce'], request_data.num_mines)
     
@@ -3988,9 +4009,7 @@ async def start_blackjack(request_data: BlackjackStartRequest, request: Request)
     if active_game:
         raise HTTPException(status_code=400, detail="You have an active blackjack hand")
     
-    seeds = await db.user_seeds.find_one({"user_id": user_id})
-    if not seeds:
-        raise HTTPException(status_code=400, detail="Please initialize seeds first")
+    seeds = await get_or_create_seeds(user_id)
     
     deck = calculate_blackjack_deck(seeds['server_seed'], seeds['client_seed'], seeds['nonce'])
     
