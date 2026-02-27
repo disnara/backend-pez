@@ -353,6 +353,22 @@ class PointsAdjustment(BaseModel):
     amount: int
     reason: Optional[str] = None
 
+class KickCommandCreate(BaseModel):
+    command: str
+    description: str
+    response: str
+    is_enabled: bool = True
+    cooldown_seconds: int = 0
+    admin_only: bool = False
+
+class KickCommandUpdate(BaseModel):
+    command: Optional[str] = None
+    description: Optional[str] = None
+    response: Optional[str] = None
+    is_enabled: Optional[bool] = None
+    cooldown_seconds: Optional[int] = None
+    admin_only: Optional[bool] = None
+
 
 # ==================== AUDIT LOG HELPER ====================
 
@@ -1918,6 +1934,156 @@ async def admin_bot_refresh_token(username: str = Depends(verify_admin)):
         raise HTTPException(status_code=400, detail="Failed to refresh token. Please re-authorize the bot.")
 
 
+# ==================== KICK COMMANDS CONFIGURATION ====================
+
+DEFAULT_KICK_COMMANDS = [
+    {"command": "!points", "description": "Check your point balance", "response": "SYSTEM", "is_enabled": True, "cooldown_seconds": 5, "admin_only": False, "is_system": True},
+    {"command": "!rank", "description": "Check your rank", "response": "SYSTEM", "is_enabled": True, "cooldown_seconds": 5, "admin_only": False, "is_system": True},
+    {"command": "!leaderboard", "description": "Show top point earners", "response": "SYSTEM", "is_enabled": True, "cooldown_seconds": 10, "admin_only": False, "is_system": True},
+    {"command": "!tip", "description": "Give points to another user", "response": "SYSTEM", "is_enabled": True, "cooldown_seconds": 5, "admin_only": False, "is_system": True},
+    {"command": "!site", "description": "Show rewards site link", "response": "🎁 Check out our rewards site! 👉 https://pezrewards.com/", "is_enabled": True, "cooldown_seconds": 30, "admin_only": False, "is_system": False},
+    {"command": "!menace", "description": "Menace casino promo", "response": "🎰 MENACE $1500 BI-WEEKLY LEADERBOARD! Double Rank-Up Rewards, VIP Transfers, Lossback, Fast Payouts - all live right now. https://menace.com/?r=pez", "is_enabled": True, "cooldown_seconds": 30, "admin_only": False, "is_system": False},
+    {"command": "!meta", "description": "Metaspins casino promo", "response": "🔥$3,200 USD Monthly Leaderboard! DOUBLE Rank-Up Rewards, up to 120% Rakeback, Monthly Deposit Comps! 🎉 Sign up & Support now 👉 https://metaspins.com/?ref=pezslaps", "is_enabled": True, "cooldown_seconds": 30, "admin_only": False, "is_system": False},
+    {"command": "!bit", "description": "Bitfortune casino promo", "response": "10K LEADERBOARD 🏁 | 20K WEEKLY RACE 🏆 | VIP Transfers 💎 | DOUBLE Rank-Up Rewards 🚀 https://join.bitfortune.com/pezslaps", "is_enabled": True, "cooldown_seconds": 30, "admin_only": False, "is_system": False},
+    {"command": "!discord", "description": "Discord invite link", "response": "💬 Join the Discord to stay up to date, connect with the community, and enter giveaways! 🎁 👉 https://discord.gg/TRThDgz77W", "is_enabled": True, "cooldown_seconds": 30, "admin_only": False, "is_system": False},
+]
+
+async def ensure_default_commands():
+    """Seed default commands if kick_commands collection is empty"""
+    if db is None:
+        return
+    
+    count = await db.kick_commands.count_documents({})
+    if count == 0:
+        for cmd in DEFAULT_KICK_COMMANDS:
+            cmd["created_at"] = datetime.utcnow().isoformat()
+            cmd["updated_at"] = datetime.utcnow().isoformat()
+        await db.kick_commands.insert_many(DEFAULT_KICK_COMMANDS)
+        logger.info("Seeded default kick commands")
+
+@api_router.get("/admin/kick-commands")
+async def admin_get_kick_commands(username: str = Depends(verify_admin)):
+    """Get all kick commands"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    await ensure_default_commands()
+    
+    commands = await db.kick_commands.find({}, {"_id": 0}).sort("command", 1).to_list(100)
+    return {"success": True, "commands": commands}
+
+@api_router.post("/admin/kick-commands")
+async def admin_create_kick_command(cmd: KickCommandCreate, username: str = Depends(verify_admin)):
+    """Create a new kick command"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    # Check if command already exists
+    existing = await db.kick_commands.find_one({"command": cmd.command.lower()})
+    if existing:
+        raise HTTPException(status_code=400, detail=f"Command {cmd.command} already exists")
+    
+    # Ensure command starts with !
+    command_name = cmd.command.lower()
+    if not command_name.startswith("!"):
+        command_name = "!" + command_name
+    
+    new_command = {
+        "command": command_name,
+        "description": cmd.description,
+        "response": cmd.response,
+        "is_enabled": cmd.is_enabled,
+        "cooldown_seconds": cmd.cooldown_seconds,
+        "admin_only": cmd.admin_only,
+        "is_system": False,
+        "created_at": datetime.utcnow().isoformat(),
+        "updated_at": datetime.utcnow().isoformat()
+    }
+    
+    await db.kick_commands.insert_one(new_command)
+    
+    await create_audit_log(
+        action="kick_command_created",
+        admin_username=username,
+        details={"command": command_name}
+    )
+    
+    return {"success": True, "command": {k: v for k, v in new_command.items() if k != "_id"}}
+
+@api_router.put("/admin/kick-commands/{command_name}")
+async def admin_update_kick_command(command_name: str, cmd: KickCommandUpdate, username: str = Depends(verify_admin)):
+    """Update a kick command"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    # URL decode the command name
+    command_name = urllib.parse.unquote(command_name)
+    
+    existing = await db.kick_commands.find_one({"command": command_name})
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Command {command_name} not found")
+    
+    update_data = {"updated_at": datetime.utcnow().isoformat()}
+    
+    if cmd.description is not None:
+        update_data["description"] = cmd.description
+    if cmd.response is not None:
+        update_data["response"] = cmd.response
+    if cmd.is_enabled is not None:
+        update_data["is_enabled"] = cmd.is_enabled
+    if cmd.cooldown_seconds is not None:
+        update_data["cooldown_seconds"] = cmd.cooldown_seconds
+    if cmd.admin_only is not None:
+        update_data["admin_only"] = cmd.admin_only
+    
+    await db.kick_commands.update_one({"command": command_name}, {"$set": update_data})
+    
+    await create_audit_log(
+        action="kick_command_updated",
+        admin_username=username,
+        details={"command": command_name, "changes": update_data}
+    )
+    
+    updated = await db.kick_commands.find_one({"command": command_name}, {"_id": 0})
+    return {"success": True, "command": updated}
+
+@api_router.delete("/admin/kick-commands/{command_name}")
+async def admin_delete_kick_command(command_name: str, username: str = Depends(verify_admin)):
+    """Delete a kick command (only custom commands can be deleted)"""
+    if db is None:
+        raise HTTPException(status_code=503, detail="Database not available")
+    
+    # URL decode the command name
+    command_name = urllib.parse.unquote(command_name)
+    
+    existing = await db.kick_commands.find_one({"command": command_name})
+    if not existing:
+        raise HTTPException(status_code=404, detail=f"Command {command_name} not found")
+    
+    if existing.get("is_system", False):
+        raise HTTPException(status_code=400, detail="Cannot delete system commands. You can only disable them.")
+    
+    await db.kick_commands.delete_one({"command": command_name})
+    
+    await create_audit_log(
+        action="kick_command_deleted",
+        admin_username=username,
+        details={"command": command_name}
+    )
+    
+    return {"success": True, "message": f"Command {command_name} deleted"}
+
+async def get_command_response(command: str) -> Optional[str]:
+    """Get command response from database"""
+    if db is None:
+        return None
+    
+    cmd = await db.kick_commands.find_one({"command": command.lower(), "is_enabled": True})
+    if cmd and cmd.get("response") != "SYSTEM":
+        return cmd.get("response")
+    return None
+
+
 # ==================== EARNING RATES ====================
 
 @api_router.get("/admin/earning-rates")
@@ -2904,21 +3070,21 @@ async def kick_webhook(request: Request):
                 response_message = await handle_unban_command(sender_username, content)
             elif content_lower == "!rank":
                 response_message = await handle_rank_command(sender_username)
-            elif content_lower in ["!commands", "!help"]:
-                response_message = "Commands: !points | !rank | !leaderboard | !site | !menace | !meta | !bit | !discord"
-            # Custom promo commands
-            elif content_lower == "!site":
-                response_message = "🎁 Check out our rewards site! 👉 https://pezrewards.com/"
-            elif content_lower == "!menace":
-                response_message = "🎰 MENACE $1500 BI-WEEKLY LEADERBOARD! Double Rank-Up Rewards, VIP Transfers, Lossback, Fast Payouts - all live right now. https://menace.com/?r=pez"
-            elif content_lower == "!meta":
-                response_message = "🔥$3,200 USD Monthly Leaderboard! DOUBLE Rank-Up Rewards, up to 120% Rakeback, Monthly Deposit Comps! 🎉 Sign up & Support now 👉 https://metaspins.com/?ref=pezslaps"
-            elif content_lower == "!bit":
-                response_message = "5K LEADERBOARD 🏁 | 20K WEEKLY RACE 🏆 | VIP Transfers 💎 | DOUBLE Rank-Up Rewards 🚀 https://join.bitfortune.com/pezslaps"
-            elif content_lower == "!discord":
-                response_message = "💬 Join the Discord to stay up to date, connect with the community, and enter giveaways! 🎁 👉 https://discord.gg/TRThDgz77W"
+            elif content_lower in ["!commands"]:
+                # Build commands list from enabled commands in database
+                if db is not None:
+                    cmds = await db.kick_commands.find({"is_enabled": True}, {"command": 1, "_id": 0}).to_list(50)
+                    cmd_list = " | ".join([c["command"] for c in cmds])
+                    response_message = f"Commands: {cmd_list}"
+                else:
+                    response_message = "Commands: !points | !rank | !leaderboard | !site | !menace | !meta | !bit | !discord"
             else:
-                await award_points_for_chat(sender_username, sender_user_id)
+                # Check for custom commands from database
+                custom_response = await get_command_response(content_lower)
+                if custom_response:
+                    response_message = custom_response
+                else:
+                    await award_points_for_chat(sender_username, sender_user_id)
             
             if response_message:
                 logger.info(f"Sending response: {response_message}")
