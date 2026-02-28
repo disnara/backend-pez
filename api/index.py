@@ -2005,6 +2005,8 @@ async def admin_create_kick_command(cmd: KickCommandCreate, username: str = Depe
     await create_audit_log(
         action="kick_command_created",
         admin_username=username,
+        target_type="kick_command",
+        target_name=command_name,
         details={"command": command_name}
     )
     
@@ -2041,6 +2043,8 @@ async def admin_update_kick_command(command_name: str, cmd: KickCommandUpdate, u
     await create_audit_log(
         action="kick_command_updated",
         admin_username=username,
+        target_type="kick_command",
+        target_name=command_name,
         details={"command": command_name, "changes": update_data}
     )
     
@@ -2068,6 +2072,8 @@ async def admin_delete_kick_command(command_name: str, username: str = Depends(v
     await create_audit_log(
         action="kick_command_deleted",
         admin_username=username,
+        target_type="kick_command",
+        target_name=command_name,
         details={"command": command_name}
     )
     
