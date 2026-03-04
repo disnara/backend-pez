@@ -503,21 +503,6 @@ DEFAULT_LEADERBOARD_SETTINGS = {
         "needs_date_filter": True,
         "is_active": True
     },
-    "metaspins": {
-        "prize_pool": "$2,000",
-        "period": "Monthly",
-        "period_type": "monthly",
-        "register_link": "https://metaspins.com/?ref=pezslaps",
-        "logo": "image/metaspins-logo.png",
-        "prizes": {
-            "1": "$700", "2": "$400", "3": "$250", "4": "$175", "5": "$150",
-            "6": "$110", "7": "$90", "8": "$75", "9": "$30", "10": "$20"
-        },
-        "start_date": "2026-02-01T00:00:00+00:00",
-        "end_date": "2026-03-01T00:00:00+00:00",
-        "needs_date_filter": False,
-        "is_active": True
-    },
     "bitfortune": {
         "prize_pool": "$5,000",
         "period": "Monthly",
@@ -571,37 +556,12 @@ async def get_site_settings(site: str):
 @api_router.get("/settings")
 async def get_all_settings():
     all_settings = {}
-    for site in ["menace", "metaspins", "bitfortune"]:
+    for site in ["menace", "bitfortune"]:
         all_settings[site] = await get_leaderboard_settings(site)
     return {"success": True, "settings": all_settings}
 
 
 # ==================== LEADERBOARD ENDPOINTS ====================
-
-@api_router.get("/leaderboard/metaspins")
-async def get_metaspins_leaderboard():
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as http_client:
-            response = await http_client.get(
-                "https://exportdata.xcdn.tech/metaspins-affiliate-leaderboard-export/1808/182639827/1099561537.json"
-            )
-            response.raise_for_status()
-            api_response = response.json()
-            
-            if isinstance(api_response, list):
-                formatted_users = []
-                for idx, user in enumerate(api_response[:20]):
-                    formatted_users.append({
-                        "rank": idx + 1,
-                        "username": user.get("username", "Unknown"),
-                        "wagered": user.get("bets", 0),
-                        "avatar": ""
-                    })
-                return {"success": True, "site": "metaspins", "data": formatted_users}
-            return {"success": False, "site": "metaspins", "data": []}
-    except Exception as e:
-        logger.error(f"Metaspins API error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 @api_router.get("/leaderboard/menace")
 async def get_menace_leaderboard():
@@ -690,7 +650,6 @@ async def get_bitfortune_leaderboard():
 # ==================== TIMER ENDPOINTS ====================
 
 DEFAULT_END_TIMES = {
-    "metaspins": datetime(2026, 3, 1, 0, 0, 0, tzinfo=timezone.utc),
     "menace": datetime(2026, 2, 21, 0, 0, 0, tzinfo=timezone.utc),
     "bitfortune": datetime(2026, 2, 27, 0, 0, 0, tzinfo=timezone.utc),
 }
@@ -740,7 +699,7 @@ async def get_all_timers():
         current_time = datetime.now(timezone.utc)
         timers = {}
         
-        for site in ["menace", "metaspins", "bitfortune"]:
+        for site in ["menace", "bitfortune"]:
             end_time = await get_leaderboard_end_time(site)
             if not end_time:
                 continue
@@ -1192,7 +1151,7 @@ async def admin_login(credentials: dict, request: Request):
 @api_router.get("/admin/settings")
 async def admin_get_all_settings(username: str = Depends(verify_admin)):
     all_settings = {}
-    for site in ["menace", "metaspins", "bitfortune"]:
+    for site in ["menace", "bitfortune"]:
         all_settings[site] = await get_leaderboard_settings(site)
     return {"success": True, "settings": all_settings}
 
@@ -1943,7 +1902,6 @@ DEFAULT_KICK_COMMANDS = [
     {"command": "!tip", "description": "Give points to another user", "response": "SYSTEM", "is_enabled": True, "cooldown_seconds": 5, "admin_only": False, "is_system": True},
     {"command": "!site", "description": "Show rewards site link", "response": "🎁 Check out our rewards site! 👉 https://pezrewards.com/", "is_enabled": True, "cooldown_seconds": 30, "admin_only": False, "is_system": False},
     {"command": "!menace", "description": "Menace casino promo", "response": "🎰 MENACE $1500 BI-WEEKLY LEADERBOARD! Double Rank-Up Rewards, VIP Transfers, Lossback, Fast Payouts - all live right now. https://menace.com/?r=pez", "is_enabled": True, "cooldown_seconds": 30, "admin_only": False, "is_system": False},
-    {"command": "!meta", "description": "Metaspins casino promo", "response": "🔥$3,200 USD Monthly Leaderboard! DOUBLE Rank-Up Rewards, up to 120% Rakeback, Monthly Deposit Comps! 🎉 Sign up & Support now 👉 https://metaspins.com/?ref=pezslaps", "is_enabled": True, "cooldown_seconds": 30, "admin_only": False, "is_system": False},
     {"command": "!bit", "description": "Bitfortune casino promo", "response": "10K LEADERBOARD 🏁 | 20K WEEKLY RACE 🏆 | VIP Transfers 💎 | DOUBLE Rank-Up Rewards 🚀 https://join.bitfortune.com/pezslaps", "is_enabled": True, "cooldown_seconds": 30, "admin_only": False, "is_system": False},
     {"command": "!discord", "description": "Discord invite link", "response": "💬 Join the Discord to stay up to date, connect with the community, and enter giveaways! 🎁 👉 https://discord.gg/TRThDgz77W", "is_enabled": True, "cooldown_seconds": 30, "admin_only": False, "is_system": False},
 ]
@@ -2634,7 +2592,7 @@ def calculate_next_period_end(current_end: datetime, period_type: str) -> dateti
 @api_router.get("/admin/leaderboard-timers")
 async def admin_get_leaderboard_timers(username: str = Depends(verify_admin)):
     timers = {}
-    for site in ["menace", "metaspins", "bitfortune"]:
+    for site in ["menace", "bitfortune"]:
         settings = await get_leaderboard_settings(site)
         end_time = await get_leaderboard_end_time(site)
         current_time = datetime.now(timezone.utc)
