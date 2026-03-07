@@ -1705,7 +1705,7 @@ async def admin_get_bot_status(username: str = Depends(verify_admin)):
         "status": "fully_configured" if (channel_authorized and bot_authorized) else ("partially_configured" if (channel_authorized or bot_authorized) else "not_authorized"),
         "channel_account": channel_tokens.get("username") if channel_tokens else None,
         "bot_account": bot_tokens.get("username") if bot_tokens else None,
-        "commands": ["!points", "!rank", "!leaderboard", "!tip", "!addpoints", "!removepoints", "!setpoints", "!ban", "!unban"]
+        "commands": ["!points", "!rank", "!leaderboard", "!tip", "!addpoints", "!removepoints", "!setpoints", "!ban", "!unban", "!giveall"]
     }
     return {"success": True, "bot": bot_config}
 
@@ -1900,6 +1900,7 @@ DEFAULT_KICK_COMMANDS = [
     {"command": "!rank", "description": "Check your rank", "response": "SYSTEM", "is_enabled": True, "cooldown_seconds": 5, "admin_only": False, "is_system": True},
     {"command": "!leaderboard", "description": "Show top point earners", "response": "SYSTEM", "is_enabled": True, "cooldown_seconds": 10, "admin_only": False, "is_system": True},
     {"command": "!tip", "description": "Give points to another user", "response": "SYSTEM", "is_enabled": True, "cooldown_seconds": 5, "admin_only": False, "is_system": True},
+    {"command": "!giveall", "description": "Give points to ALL registered users (Admin only)", "response": "SYSTEM", "is_enabled": True, "cooldown_seconds": 60, "admin_only": True, "is_system": True},
     {"command": "!site", "description": "Show rewards site link", "response": "🎁 Check out our rewards site! 👉 https://pezrewards.com/", "is_enabled": True, "cooldown_seconds": 30, "admin_only": False, "is_system": False},
     {"command": "!menace", "description": "Menace casino promo", "response": "🎰 MENACE $1500 BI-WEEKLY LEADERBOARD! Double Rank-Up Rewards, VIP Transfers, Lossback, Fast Payouts - all live right now. https://menace.com/?r=pez", "is_enabled": True, "cooldown_seconds": 30, "admin_only": False, "is_system": False},
     {"command": "!bit", "description": "Bitfortune casino promo", "response": "10K LEADERBOARD 🏁 | 20K WEEKLY RACE 🏆 | VIP Transfers 💎 | DOUBLE Rank-Up Rewards 🚀 https://join.bitfortune.com/pezslaps", "is_enabled": True, "cooldown_seconds": 30, "admin_only": False, "is_system": False},
@@ -2997,6 +2998,46 @@ async def handle_unban_command(sender: str, content: str):
         return f"@{sender} Unbanned @{target}. They can earn points again!"
     return f"@{sender} Failed to unban user."
 
+async def handle_giveall_command(sender: str, content: str):
+    """Give points to ALL registered users - Admin only"""
+    if sender.lower() not in KICK_ADMINS:
+        return f"@{sender} Only the channel owner can use !giveall"
+    
+    parts = content.split()
+    if len(parts) < 2:
+        return f"@{sender} Usage: !giveall <amount>"
+    
+    try:
+        amount = int(parts[1])
+    except ValueError:
+        return f"@{sender} Invalid amount. Usage: !giveall <amount>"
+    
+    if amount <= 0:
+        return f"@{sender} Amount must be positive!"
+    
+    if amount > 100000:
+        return f"@{sender} Maximum giveall amount is 100,000 points!"
+    
+    if db is None:
+        return "Service temporarily unavailable"
+    
+    # Count total registered users (not banned)
+    total_users = await db.users.count_documents({"is_banned": {"$ne": True}})
+    
+    if total_users == 0:
+        return f"@{sender} No registered users found!"
+    
+    # Update all non-banned users
+    result = await db.users.update_many(
+        {"is_banned": {"$ne": True}},
+        {"$inc": {"points_balance": amount, "total_earned": amount}}
+    )
+    
+    if result.modified_count > 0:
+        total_given = amount * result.modified_count
+        return f"@{sender} Gave {amount:,} points to {result.modified_count:,} users! Total: {total_given:,} points distributed!"
+    return f"@{sender} Failed to distribute points."
+
 @api_router.post("/webhook/kick")
 async def kick_webhook(request: Request):
     try:
@@ -3032,6 +3073,8 @@ async def kick_webhook(request: Request):
                 response_message = await handle_ban_command(sender_username, content)
             elif content_lower.startswith("!unban "):
                 response_message = await handle_unban_command(sender_username, content)
+            elif content_lower.startswith("!giveall "):
+                response_message = await handle_giveall_command(sender_username, content)
             elif content_lower == "!rank":
                 response_message = await handle_rank_command(sender_username)
             elif content_lower in ["!commands"]:
