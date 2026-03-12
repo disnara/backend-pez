@@ -486,32 +486,17 @@ async def get_pkce(state: str) -> str:
     return None
 
 
-# Default leaderboard settings
+# Default leaderboard settings - Bitfortune only
 DEFAULT_LEADERBOARD_SETTINGS = {
-    "menace": {
-        "prize_pool": "$1,500",
-        "period": "Bi-Weekly",
-        "period_type": "bi-weekly",
-        "register_link": "https://menace.com/?r=pez",
-        "logo": "image/menace.png",
-        "prizes": {
-            "1": "$600", "2": "$300", "3": "$200", "4": "$150", "5": "$100",
-            "6": "$60", "7": "$40", "8": "$30", "9": "$15", "10": "$5"
-        },
-        "start_date": "2026-02-07T00:00:00+00:00",
-        "end_date": "2026-02-21T00:00:00+00:00",
-        "needs_date_filter": True,
-        "is_active": True
-    },
     "bitfortune": {
-        "prize_pool": "$5,000",
+        "prize_pool": "$10,000",
         "period": "Monthly",
         "period_type": "monthly",
         "register_link": "https://join.bitfortune.com/pezslaps",
         "logo": "image/bitfortune-logo.png",
         "prizes": {
-            "1": "$2,000", "2": "$1,200", "3": "$700", "4": "$400", "5": "$250",
-            "6": "$150", "7": "$120", "8": "$80", "9": "$60", "10": "$40"
+            "1": "$4,000", "2": "$2,000", "3": "$1,200", "4": "$800", "5": "$600",
+            "6": "$400", "7": "$300", "8": "$250", "9": "$200", "10": "$150"
         },
         "start_date": "2026-01-27T00:00:00+00:00",
         "end_date": "2026-02-27T00:00:00+00:00",
@@ -556,55 +541,12 @@ async def get_site_settings(site: str):
 @api_router.get("/settings")
 async def get_all_settings():
     all_settings = {}
-    for site in ["menace", "bitfortune"]:
+    for site in ["bitfortune"]:
         all_settings[site] = await get_leaderboard_settings(site)
     return {"success": True, "settings": all_settings}
 
 
 # ==================== LEADERBOARD ENDPOINTS ====================
-
-@api_router.get("/leaderboard/menace")
-async def get_menace_leaderboard():
-    try:
-        settings = await get_leaderboard_settings("menace")
-        start_date = "2026-02-07"
-        end_date = "2026-02-21"
-        
-        if settings.get("start_date"):
-            try:
-                start_dt = datetime.fromisoformat(settings["start_date"].replace('Z', '+00:00'))
-                start_date = start_dt.strftime("%Y-%m-%d")
-            except:
-                pass
-        
-        if settings.get("end_date"):
-            try:
-                end_dt = datetime.fromisoformat(settings["end_date"].replace('Z', '+00:00'))
-                end_date = end_dt.strftime("%Y-%m-%d")
-            except:
-                pass
-        
-        async with httpx.AsyncClient(timeout=30.0) as http_client:
-            url = "https://api-prod.gaze.bet/api/leaderboard/LSNCGAYMCPRJ/fb7d008f-a6e5-4d00-81f9-2e4afd9c5b7a"
-            params = {"dateStart": start_date, "dateEnd": end_date, "limit": 20}
-            response = await http_client.get(url, params=params)
-            response.raise_for_status()
-            api_response = response.json()
-            
-            if "leaderboard" in api_response and isinstance(api_response["leaderboard"], list):
-                formatted_users = []
-                for user in api_response["leaderboard"][:20]:
-                    formatted_users.append({
-                        "rank": user.get("place", 0),
-                        "username": user.get("nickname", "Unknown"),
-                        "wagered": user.get("wagered", 0),
-                        "avatar": ""
-                    })
-                return {"success": True, "site": "menace", "data": formatted_users, "period": {"start": start_date, "end": end_date}}
-            return {"success": False, "site": "menace", "data": []}
-    except Exception as e:
-        logger.error(f"Menace API error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
 
 BITFORTUNE_API_KEY = "082a6a65-4da1-425c-9b44-cf609e988672"
 
@@ -650,7 +592,6 @@ async def get_bitfortune_leaderboard():
 # ==================== TIMER ENDPOINTS ====================
 
 DEFAULT_END_TIMES = {
-    "menace": datetime(2026, 2, 21, 0, 0, 0, tzinfo=timezone.utc),
     "bitfortune": datetime(2026, 2, 27, 0, 0, 0, tzinfo=timezone.utc),
 }
 
@@ -699,7 +640,7 @@ async def get_all_timers():
         current_time = datetime.now(timezone.utc)
         timers = {}
         
-        for site in ["menace", "bitfortune"]:
+        for site in ["bitfortune"]:
             end_time = await get_leaderboard_end_time(site)
             if not end_time:
                 continue
@@ -1151,7 +1092,7 @@ async def admin_login(credentials: dict, request: Request):
 @api_router.get("/admin/settings")
 async def admin_get_all_settings(username: str = Depends(verify_admin)):
     all_settings = {}
-    for site in ["menace", "bitfortune"]:
+    for site in ["bitfortune"]:
         all_settings[site] = await get_leaderboard_settings(site)
     return {"success": True, "settings": all_settings}
 
@@ -1902,7 +1843,6 @@ DEFAULT_KICK_COMMANDS = [
     {"command": "!tip", "description": "Give points to another user", "response": "SYSTEM", "is_enabled": True, "cooldown_seconds": 5, "admin_only": False, "is_system": True},
     {"command": "!giveall", "description": "Give points to ALL registered users (Admin only)", "response": "SYSTEM", "is_enabled": True, "cooldown_seconds": 60, "admin_only": True, "is_system": True},
     {"command": "!site", "description": "Show rewards site link", "response": "🎁 Check out our rewards site! 👉 https://pezrewards.com/", "is_enabled": True, "cooldown_seconds": 30, "admin_only": False, "is_system": False},
-    {"command": "!menace", "description": "Menace casino promo", "response": "🎰 MENACE $1500 BI-WEEKLY LEADERBOARD! Double Rank-Up Rewards, VIP Transfers, Lossback, Fast Payouts - all live right now. https://menace.com/?r=pez", "is_enabled": True, "cooldown_seconds": 30, "admin_only": False, "is_system": False},
     {"command": "!bit", "description": "Bitfortune casino promo", "response": "10K LEADERBOARD 🏁 | 20K WEEKLY RACE 🏆 | VIP Transfers 💎 | DOUBLE Rank-Up Rewards 🚀 https://join.bitfortune.com/pezslaps", "is_enabled": True, "cooldown_seconds": 30, "admin_only": False, "is_system": False},
     {"command": "!discord", "description": "Discord invite link", "response": "💬 Join the Discord to stay up to date, connect with the community, and enter giveaways! 🎁 👉 https://discord.gg/TRThDgz77W", "is_enabled": True, "cooldown_seconds": 30, "admin_only": False, "is_system": False},
 ]
@@ -2593,7 +2533,7 @@ def calculate_next_period_end(current_end: datetime, period_type: str) -> dateti
 @api_router.get("/admin/leaderboard-timers")
 async def admin_get_leaderboard_timers(username: str = Depends(verify_admin)):
     timers = {}
-    for site in ["menace", "bitfortune"]:
+    for site in ["bitfortune"]:
         settings = await get_leaderboard_settings(site)
         end_time = await get_leaderboard_end_time(site)
         current_time = datetime.now(timezone.utc)
@@ -3084,7 +3024,7 @@ async def kick_webhook(request: Request):
                     cmd_list = " | ".join([c["command"] for c in cmds])
                     response_message = f"Commands: {cmd_list}"
                 else:
-                    response_message = "Commands: !points | !rank | !leaderboard | !site | !menace | !meta | !bit | !discord"
+                    response_message = "Commands: !points | !rank | !leaderboard | !site | !bit | !discord"
             else:
                 # Check for custom commands from database
                 custom_response = await get_command_response(content_lower)
